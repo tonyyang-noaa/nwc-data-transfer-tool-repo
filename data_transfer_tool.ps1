@@ -9,11 +9,11 @@ Add-Type -AssemblyName Microsoft.VisualBasic
 $Global:JsonTempFile = [System.IO.Path]::GetFullPath("$env:TEMP\unified_out_$([guid]::NewGuid().ToString('N')).json")
 $Global:RunLogFile = ""
 $Global:ExcludeFile = ""
+$Global:BatFile = ""
 $Global:CurrentProcess = $null
-$Global:ActiveTransfer = $null
-$Global:TransferUiTimer = $null
 $Global:StopTransfer = $false
 $Global:LoadingHistory = $false 
+$Global:FullLogLines = New-Object System.Collections.ArrayList
 
 # ENGINE FIX: UI Soft-Lock State Tracker
 $Global:IsTransferring = $false
@@ -25,7 +25,9 @@ $Global:SortAsc = $true
 
 # App Data & Persistence
 $Global:AppDir = Join-Path $env:APPDATA "DataTransferTool"
-if (-not (Test-Path -LiteralPath $Global:AppDir)) { New-Item -ItemType Directory -Path $Global:AppDir | Out-Null }
+if (-not (Test-Path -LiteralPath $Global:AppDir)) { 
+    try { New-Item -ItemType Directory -Path $Global:AppDir -ErrorAction Stop | Out-Null } catch {} 
+}
 $Global:DbPath = Join-Path $Global:AppDir "tasks_v1.json"
 $Global:SettingsFile = Join-Path $Global:AppDir "settings.json"
 $Global:TempConfig = Join-Path $Global:AppDir "rclone_persistent.conf" 
@@ -57,8 +59,8 @@ $Global:DefaultFilters = @(
     "\Windows\Temp\"
 )
 
-# ENGINE FIX: Added TransferThreads to AppSettings (defaulting to 3)
-$Global:AppSettings = [PSCustomObject]@{ RclonePath = ""; GCloudPath = ""; IsDarkMode = $true; IsDebugMode = $false; TransferThreads = 3; CustomFilters = @() }
+# UI FIX 1: Set Default Theme to Light Mode (IsDarkMode = $false)
+$Global:AppSettings = [PSCustomObject]@{ RclonePath = ""; GCloudPath = ""; IsDarkMode = $false; IsDebugMode = $false; TransferThreads = 3; CustomFilters = @(); DriveClientId = ""; DriveClientSecret = "" }
 
 # Dual Engine States
 $Global:SrcProvider = ""; $Global:DstProvider = ""
@@ -75,42 +77,13 @@ $Global:GcsBridgeName = "GCSBridge"
 $Global:ScriptDir = $PSScriptRoot
 if ([string]::IsNullOrEmpty($Global:ScriptDir)) { $Global:ScriptDir = [System.IO.Path]::GetDirectoryName([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) }
 
-class TransferCommand {
-    [string]$Source
-    [string]$Destination
-    [string]$ToolPath
-    [string]$Arguments
-    [string]$WorkingDirectory
-    [hashtable]$Environment
-    [string]$Description
-
-    TransferCommand() {
-        $this.Environment = @{}
-    }
-}
-
-class TransferJob {
-    [string]$Source
-    [string]$Destination
-    [string]$ToolPath
-    [string]$DisplayName
-    [int]$TotalItems
-    [string]$ExcludeFile
-    [TransferCommand[]]$Commands
-
-    TransferJob() {
-        $this.TotalItems = -1
-        $this.Commands = @()
-    }
-}
-
 # --- 1. SYSTEM ENVIRONMENT & SETTINGS ---
-Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\python.exe" -Name "(Default)" -ErrorAction SilentlyContinue
-Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\python3.exe" -Name "(Default)" -ErrorAction SilentlyContinue
+try { Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\python.exe" -Name "(Default)" -ErrorAction Stop } catch {}
+try { Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\python3.exe" -Name "(Default)" -ErrorAction Stop } catch {}
 
 function Load-Settings {
-    if (Test-Path -LiteralPath $Global:SettingsFile) {
-        try { 
+    try {
+        if (Test-Path -LiteralPath $Global:SettingsFile -ErrorAction Stop) {
             $loaded = Get-Content -Raw -LiteralPath $Global:SettingsFile | ConvertFrom-Json 
             if ($loaded.RclonePath) { $Global:AppSettings.RclonePath = $loaded.RclonePath }
             if ($loaded.GCloudPath) { $Global:AppSettings.GCloudPath = $loaded.GCloudPath }
@@ -118,8 +91,10 @@ function Load-Settings {
             if ($null -ne $loaded.IsDebugMode) { $Global:AppSettings.IsDebugMode = [bool]$loaded.IsDebugMode }
             if ($null -ne $loaded.TransferThreads) { $Global:AppSettings.TransferThreads = [int]$loaded.TransferThreads }
             if ($loaded.CustomFilters) { $Global:AppSettings.CustomFilters = $loaded.CustomFilters }
-        } catch {}
-    }
+            if ($loaded.DriveClientId) { $Global:AppSettings.DriveClientId = $loaded.DriveClientId }
+            if ($loaded.DriveClientSecret) { $Global:AppSettings.DriveClientSecret = $loaded.DriveClientSecret }
+        }
+    } catch {}
 }
 
 function Save-Settings { $Global:AppSettings | ConvertTo-Json -Depth 2 | Out-File -LiteralPath $Global:SettingsFile -Encoding utf8 -Force }
@@ -132,63 +107,111 @@ $Global:CustomFilters = $Global:AppSettings.CustomFilters
 
 function Set-RcloneEnvironment {
     $Global:RcloneExe = ""
-    if (![string]::IsNullOrWhiteSpace($Global:AppSettings.RclonePath) -and (Test-Path -LiteralPath $Global:AppSettings.RclonePath)) {
+    $customRcloneValid = $false
+    try {
+        if (![string]::IsNullOrWhiteSpace($Global:AppSettings.RclonePath) -and (Test-Path -LiteralPath $Global:AppSettings.RclonePath -ErrorAction Stop)) {
+            $customRcloneValid = $true
+        }
+    } catch {}
+
+    if ($customRcloneValid) {
         $Global:RcloneExe = $Global:AppSettings.RclonePath
     } else {
         $Global:RcloneExe = Join-Path -Path $Global:ScriptDir -ChildPath "rclone.exe"
-        if (-not (Test-Path -LiteralPath $Global:RcloneExe)) { 
-            $rCmd = Get-Command "rclone.exe" -ErrorAction SilentlyContinue
-            if ($rCmd) { $Global:RcloneExe = $rCmd.Source }
+        $localRcloneExists = $false
+        try {
+            if (Test-Path -LiteralPath $Global:RcloneExe -ErrorAction Stop) { $localRcloneExists = $true }
+        } catch {}
+
+        if (-not $localRcloneExists) { 
+            try {
+                $rCmd = Get-Command "rclone.exe" -ErrorAction Stop
+                if ($rCmd) { $Global:RcloneExe = $rCmd.Source }
+            } catch {
+            }
         }
     }
+    
     if ($Global:RcloneExe) {
         $confStr = @"
 [$Global:GcsBridgeName]
 type = google cloud storage
 env_auth = true
 "@
-        if (-not (Test-Path $Global:TempConfig)) { $confStr | Out-File $Global:TempConfig -Encoding utf8 }
-        elseif ((Get-Content $Global:TempConfig -Raw) -notmatch "\[$Global:GcsBridgeName\]") { Add-Content -Path $Global:TempConfig -Value "`n$confStr" }
+        try {
+            if (-not (Test-Path $Global:TempConfig -ErrorAction Stop)) { 
+                $confStr | Out-File $Global:TempConfig -Encoding utf8 
+            } elseif ((Get-Content $Global:TempConfig -Raw) -notmatch "\[$Global:GcsBridgeName\]") { 
+                Add-Content -Path $Global:TempConfig -Value "`n$confStr" 
+            }
+        } catch {}
     }
 }
 
 function Set-GCloudEnvironment {
     $Global:GCloudBin = ""
-    if (![string]::IsNullOrWhiteSpace($Global:AppSettings.GCloudPath) -and (Test-Path -LiteralPath $Global:AppSettings.GCloudPath)) {
+    $customGcloudValid = $false
+    try {
+        if (![string]::IsNullOrWhiteSpace($Global:AppSettings.GCloudPath) -and (Test-Path -LiteralPath $Global:AppSettings.GCloudPath -ErrorAction Stop)) {
+            $customGcloudValid = $true
+        }
+    } catch {}
+
+    if ($customGcloudValid) {
         $Global:GCloudBin = $Global:AppSettings.GCloudPath
         $env:Path += ";$Global:GCloudBin"
     } else {
-        $gcloudCmd = Get-Command "gcloud.cmd" -ErrorAction SilentlyContinue
-        if (!$gcloudCmd) {
+        try {
+            $gcloudCmd = Get-Command "gcloud.cmd" -ErrorAction Stop
+            if ($gcloudCmd) { $Global:GCloudBin = Split-Path $gcloudCmd.Source }
+        } catch {}
+
+        if (!$Global:GCloudBin) {
             $defaultPaths = @("$env:LocalAppData\Google\Cloud SDK\google-cloud-sdk\bin", "${env:ProgramFiles(x86)}\Google\Cloud SDK\google-cloud-sdk\bin")
-            foreach ($p in $defaultPaths) { if (Test-Path -LiteralPath "$p\gcloud.cmd") { $env:Path += ";$p"; $gcloudCmd = Get-Command "gcloud.cmd"; break } }
+            foreach ($p in $defaultPaths) { 
+                try {
+                    if (Test-Path -LiteralPath "$p\gcloud.cmd" -ErrorAction Stop) { 
+                        $env:Path += ";$p"
+                        $Global:GCloudBin = $p
+                        break 
+                    }
+                } catch {}
+            }
         }
-        if ($gcloudCmd) { $Global:GCloudBin = Split-Path $gcloudCmd.Source }
     }
+    
     if ($Global:GCloudBin) {
         $sdkRoot = Split-Path $Global:GCloudBin
         $BundledPython = Join-Path $sdkRoot "platform\bundledpython\python.exe"
-        if (Test-Path -LiteralPath $BundledPython) { $env:CLOUDSDK_PYTHON = $BundledPython }
+        try {
+            if (Test-Path -LiteralPath $BundledPython -ErrorAction Stop) { $env:CLOUDSDK_PYTHON = $BundledPython }
+        } catch {}
     }
     
     $adcPath = Join-Path $env:APPDATA "gcloud\application_default_credentials.json"
-    if (Test-Path $adcPath) { $env:GOOGLE_APPLICATION_CREDENTIALS = $adcPath }
+    try {
+        if (Test-Path $adcPath -ErrorAction Stop) { $env:GOOGLE_APPLICATION_CREDENTIALS = $adcPath }
+    } catch {}
 }
 
 Set-RcloneEnvironment; Set-GCloudEnvironment
 
 function Load-Tasks {
-    if (Test-Path -LiteralPath $Global:DbPath) {
-        try { $Global:Tasks = (Get-Content -Raw -LiteralPath $Global:DbPath | ConvertFrom-Json) } catch { $Global:Tasks = @() }
-        if ($null -eq $Global:Tasks) { $Global:Tasks = @() }
-        if ($Global:Tasks -isnot [array]) { $Global:Tasks = @($Global:Tasks) }
+    try {
+        if (Test-Path -LiteralPath $Global:DbPath -ErrorAction Stop) {
+            $Global:Tasks = (Get-Content -Raw -LiteralPath $Global:DbPath | ConvertFrom-Json)
+        }
+    } catch { 
+        $Global:Tasks = @() 
     }
+    if ($null -eq $Global:Tasks) { $Global:Tasks = @() }
+    if ($Global:Tasks -isnot [array]) { $Global:Tasks = @($Global:Tasks) }
 }
 function Save-Tasks { $Global:Tasks | ConvertTo-Json -Depth 10 | Out-File -LiteralPath $Global:DbPath -Encoding utf8 -Force }
 
 # --- 2. GUI INITIALIZATION (SIDE-BY-SIDE LAYOUT) ---
 $Form = New-Object System.Windows.Forms.Form
-$Form.Text = "Data Transfer Tool v1.1.29"
+$Form.Text = "Data Transfer Tool v1.1.43"
 $ScreenArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $AppWidth = 1250; $AppHeight = if ($ScreenArea.Height -lt 850) { [math]::Max(750, $ScreenArea.Height - 50) } else { 850 }
 $Form.ClientSize = New-Object System.Drawing.Size($AppWidth, $AppHeight)
@@ -246,22 +269,37 @@ $SplitRightOuter.Panel1.Controls.Add($SplitBrowsers)
 
 # Helper for generic Provider UI creation 
 function Build-BrowserPanel($Panel, $TitleStr, $Prefix) {
-    $PTop = New-Object System.Windows.Forms.Panel; $PTop.Dock = "Top"; $PTop.Height = 145; $Panel.Controls.Add($PTop)
+    if ($Prefix -eq "Src") {
+        $Global:SplitSrc = New-Object System.Windows.Forms.SplitContainer
+        $Global:SplitSrc.Orientation = [System.Windows.Forms.Orientation]::Horizontal
+        $Global:SplitSrc.Dock = "Fill"; $Global:SplitSrc.BorderStyle = "FixedSingle"; $Global:SplitSrc.SplitterWidth = 6
+        $Global:SplitSrc.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel1
+        $Panel.Controls.Add($Global:SplitSrc)
+        $Global:SplitSrc.BringToFront()
+        $TargetPanelTop = $Global:SplitSrc.Panel1
+        $TargetPanelBot = $Global:SplitSrc.Panel2
+    } else {
+        $TargetPanelTop = $Panel
+        $TargetPanelBot = $Panel
+    }
+
+    $PTop = New-Object System.Windows.Forms.Panel; $PTop.Dock = "Top"; $PTop.Height = 145; $TargetPanelTop.Controls.Add($PTop)
     
-    $yOff = 35 
+    $yOff = 38 
     
     if ($Prefix -eq "Src") {
         $LblTName = New-Object System.Windows.Forms.Label; $LblTName.Text = "Transfer Name:"; $LblTName.Font = $BoldFont; $LblTName.Location = New-Object System.Drawing.Point(5, 10); $LblTName.AutoSize = $true; $PTop.Controls.Add($LblTName)
-        $TxtTName = New-Object System.Windows.Forms.TextBox; $TxtTName.Location = New-Object System.Drawing.Point(115, 7); $TxtTName.Size = New-Object System.Drawing.Size(260, 25); $TxtTName.Anchor = "Top, Left"; $TxtTName.BackColor = $InputColor; $TxtTName.ForeColor = $TextColor; $TxtTName.BorderStyle = "FixedSingle"; $PTop.Controls.Add($TxtTName)
+        $TxtTName = New-Object System.Windows.Forms.TextBox; $TxtTName.Location = New-Object System.Drawing.Point(125, 7); $TxtTName.Size = New-Object System.Drawing.Size(250, 25); $TxtTName.Anchor = "Top, Left"; $TxtTName.BackColor = $InputColor; $TxtTName.ForeColor = $TextColor; $TxtTName.BorderStyle = "FixedSingle"; $PTop.Controls.Add($TxtTName)
         Set-Variable -Name "TxtTaskName" -Value $TxtTName -Scope Global
     }
 
     $LblTitle = New-Object System.Windows.Forms.Label; $LblTitle.Text = $TitleStr; $LblTitle.Font = $BoldFont; $LblTitle.Location = New-Object System.Drawing.Point(5, $yOff); $LblTitle.AutoSize = $true; $PTop.Controls.Add($LblTitle)
     
-    $CmbProv = New-Object System.Windows.Forms.ComboBox; $CmbProv.Location = New-Object System.Drawing.Point(115, ($yOff - 3)); $CmbProv.Size = New-Object System.Drawing.Size(260, 25); $CmbProv.DropDownStyle = "DropDownList"; $CmbProv.BackColor = $InputColor; $CmbProv.ForeColor = $TextColor; $CmbProv.FlatStyle = "Flat"; [void]$CmbProv.Items.AddRange(@("--- Select Storage ---", "Google Cloud Storage", "Google Drive", "Local Storage")); $CmbProv.SelectedIndex = 0; $CmbProv.Anchor = "Top, Left"; $PTop.Controls.Add($CmbProv)
+    $CmbProv = New-Object System.Windows.Forms.ComboBox; $CmbProv.Location = New-Object System.Drawing.Point(125, ($yOff - 3)); $CmbProv.Size = New-Object System.Drawing.Size(250, 25); $CmbProv.DropDownStyle = "DropDownList"; $CmbProv.BackColor = $InputColor; $CmbProv.ForeColor = $TextColor; $CmbProv.FlatStyle = "Flat"; [void]$CmbProv.Items.AddRange(@("--- Select Storage ---", "Google Cloud Storage", "Google Drive", "Local Storage")); $CmbProv.SelectedIndex = 0; $CmbProv.Anchor = "Top, Left"; $PTop.Controls.Add($CmbProv)
     
-    $BtnAu = New-Object System.Windows.Forms.Button; $BtnAu.Text = "Login/Auth"; $BtnAu.Location = New-Object System.Drawing.Point(5, ($yOff + 25)); $BtnAu.Size = New-Object System.Drawing.Size(100, 25); $BtnAu.Enabled = $false; Set-FlatButton $BtnAu; $PTop.Controls.Add($BtnAu)
-    $LblStat = New-Object System.Windows.Forms.Label; $LblStat.Text = "Not Connected"; $LblStat.ForeColor = "LightCoral"; $LblStat.Location = New-Object System.Drawing.Point(115, ($yOff + 30)); $LblStat.AutoSize = $true; $PTop.Controls.Add($LblStat)
+    $BtnAu = New-Object System.Windows.Forms.Button; $BtnAu.Text = "Login/Auth"; $BtnAu.Location = New-Object System.Drawing.Point(5, ($yOff + 26)); $BtnAu.Size = New-Object System.Drawing.Size(95, 25); $BtnAu.Enabled = $false; Set-FlatButton $BtnAu; $PTop.Controls.Add($BtnAu)
+    $BtnOut = New-Object System.Windows.Forms.Button; $BtnOut.Text = "Sign Out"; $BtnOut.Location = New-Object System.Drawing.Point(105, ($yOff + 26)); $BtnOut.Size = New-Object System.Drawing.Size(85, 25); $BtnOut.Enabled = $false; $BtnOut.Visible = $false; Set-FlatButton $BtnOut; $PTop.Controls.Add($BtnOut)
+    $LblStat = New-Object System.Windows.Forms.Label; $LblStat.Text = "Not Connected"; $LblStat.ForeColor = "LightCoral"; $LblStat.Location = New-Object System.Drawing.Point(195, ($yOff + 30)); $LblStat.AutoSize = $true; $PTop.Controls.Add($LblStat)
     
     $CmbProj = New-Object System.Windows.Forms.ComboBox; $CmbProj.Location = New-Object System.Drawing.Point(5, ($yOff + 55)); $CmbProj.Size = New-Object System.Drawing.Size(160, 25); $CmbProj.DropDownStyle = "DropDownList"; $CmbProj.FlatStyle = "Flat"; $CmbProj.Visible = $false; $CmbProj.Anchor = "Top, Left"; $PTop.Controls.Add($CmbProj)
     $CmbBuc = New-Object System.Windows.Forms.ComboBox; $CmbBuc.Location = New-Object System.Drawing.Point(175, ($yOff + 55)); $CmbBuc.Size = New-Object System.Drawing.Size(200, 25); $CmbBuc.DropDownStyle = "DropDownList"; $CmbBuc.FlatStyle = "Flat"; $CmbBuc.Visible = $false; $CmbBuc.Anchor = "Top, Left"; $PTop.Controls.Add($CmbBuc)
@@ -269,28 +307,14 @@ function Build-BrowserPanel($Panel, $TitleStr, $Prefix) {
     $BtnLoc = New-Object System.Windows.Forms.Button; $BtnLoc.Text = "Select Folder"; $BtnLoc.Location = New-Object System.Drawing.Point(5, ($yOff + 55)); $BtnLoc.Size = New-Object System.Drawing.Size(100, 25); Set-FlatButton $BtnLoc; $BtnLoc.Visible = $false; $PTop.Controls.Add($BtnLoc)
     
     if ($Prefix -eq "Src") {
-        $BtnFile = New-Object System.Windows.Forms.Button; $BtnFile.Text = "Select File"; $BtnFile.Location = New-Object System.Drawing.Point(110, ($yOff + 55)); $BtnFile.Size = New-Object System.Drawing.Size(90, 25); Set-FlatButton $BtnFile; $BtnFile.Visible = $false; $PTop.Controls.Add($BtnFile)
-        Set-Variable -Name "BtnSrcFile" -Value $BtnFile -Scope Global
-        
-        $BtnFilter = New-Object System.Windows.Forms.Button; $BtnFilter.Text = "Filters"; $BtnFilter.Location = New-Object System.Drawing.Point(205, ($yOff + 55)); $BtnFilter.Size = New-Object System.Drawing.Size(75, 25); Set-FlatButton $BtnFilter; $BtnFilter.Visible = $false; $PTop.Controls.Add($BtnFilter)
+        $BtnFilter = New-Object System.Windows.Forms.Button; $BtnFilter.Text = "Filters"; $BtnFilter.Location = New-Object System.Drawing.Point(110, ($yOff + 55)); $BtnFilter.Size = New-Object System.Drawing.Size(90, 25); Set-FlatButton $BtnFilter; $BtnFilter.Visible = $false; $PTop.Controls.Add($BtnFilter)
         Set-Variable -Name "BtnSrcFilter" -Value $BtnFilter -Scope Global
     }
 
     $LblPth = New-Object System.Windows.Forms.Label; $LblPth.Text = "Path: /"; $LblPth.Location = New-Object System.Drawing.Point(5, ($yOff + 85)); $LblPth.Size = New-Object System.Drawing.Size(390, 20); $LblPth.Anchor = "Top, Left, Right"; $LblPth.AutoSize = $false; $LblPth.AutoEllipsis = $true; $PTop.Controls.Add($LblPth)
 
     if ($Prefix -eq "Src") {
-        
-        # UI TWEAK: Replace static bottom panel with a flexible horizontal SplitContainer
-        $Global:SplitSrc = New-Object System.Windows.Forms.SplitContainer
-        $Global:SplitSrc.Orientation = [System.Windows.Forms.Orientation]::Horizontal
-        $Global:SplitSrc.Dock = "Fill"
-        $Global:SplitSrc.BorderStyle = "FixedSingle"
-        $Global:SplitSrc.SplitterWidth = 6
-        $Global:SplitSrc.FixedPanel = [System.Windows.Forms.FixedPanel]::Panel1
-        $Panel.Controls.Add($Global:SplitSrc)
-        $Global:SplitSrc.BringToFront()
-
-        $PBot = New-Object System.Windows.Forms.Panel; $PBot.Dock = "Fill"; $Global:SplitSrc.Panel2.Controls.Add($PBot)
+        $PBot = New-Object System.Windows.Forms.Panel; $PBot.Dock = "Fill"; $TargetPanelBot.Controls.Add($PBot)
         
         $PBotTop = New-Object System.Windows.Forms.Panel; $PBotTop.Dock = "Top"; $PBotTop.Height = 35; $PBot.Controls.Add($PBotTop)
         
@@ -310,7 +334,7 @@ function Build-BrowserPanel($Panel, $TitleStr, $Prefix) {
         $ChkList.BringToFront()
         Set-Variable -Name "ChkExclusions" -Value $ChkList -Scope Global
     } else {
-        $PBot = New-Object System.Windows.Forms.Panel; $PBot.Dock = "Bottom"; $PBot.Height = 35; $Panel.Controls.Add($PBot)
+        $PBot = New-Object System.Windows.Forms.Panel; $PBot.Dock = "Bottom"; $PBot.Height = 35; $TargetPanelBot.Controls.Add($PBot)
         
         $LblSort = New-Object System.Windows.Forms.Label; $LblSort.Text = "Sort:"; $LblSort.Font = $BoldFont; $LblSort.Location = New-Object System.Drawing.Point(5, 8); $LblSort.AutoSize = $true; $PBot.Controls.Add($LblSort)
         $CmbSrt = New-Object System.Windows.Forms.ComboBox; $CmbSrt.Location = New-Object System.Drawing.Point(45, 5); $CmbSrt.Size = New-Object System.Drawing.Size(100, 25); $CmbSrt.DropDownStyle = "DropDownList"; $CmbSrt.FlatStyle = "Flat"; [void]$CmbSrt.Items.AddRange(@("Name (A-Z)", "Name (Z-A)", "Date (New)", "Date (Old)")); $CmbSrt.SelectedIndex = 0; $PBot.Controls.Add($CmbSrt)
@@ -323,22 +347,27 @@ function Build-BrowserPanel($Panel, $TitleStr, $Prefix) {
         Set-Variable -Name "BtnDstNewF" -Value $BtnNFolder -Scope Global
     }
 
-    $Lbx = New-Object System.Windows.Forms.ListBox; $Lbx.Dock = "Fill"; $Lbx.IntegralHeight = $false; $Lbx.Font = $LogFont; $Lbx.Enabled = $false; $Lbx.BackColor = $InputColor; $Lbx.ForeColor = $TextColor; $Lbx.BorderStyle = "FixedSingle"; 
-    if ($Prefix -eq "Src") {
-        $Global:SplitSrc.Panel1.Controls.Add($Lbx)
-    } else {
-        $Panel.Controls.Add($Lbx)
-    }
+    $Lbx = New-Object System.Windows.Forms.ListBox; $Lbx.Dock = "Fill"; $Lbx.IntegralHeight = $false; $Lbx.Font = $LogFont; $Lbx.Enabled = $false; $Lbx.BackColor = $InputColor; $Lbx.ForeColor = $TextColor; $Lbx.BorderStyle = "FixedSingle"; $Lbx.DisplayMember = "DisplayString"; $TargetPanelTop.Controls.Add($Lbx)
     $Lbx.BringToFront()
     
-    Set-Variable -Name "Cmb${Prefix}Provider" -Value $CmbProv -Scope Global
-    Set-Variable -Name "Btn${Prefix}Auth" -Value $BtnAu -Scope Global
-    Set-Variable -Name "Lbl${Prefix}AuthStatus" -Value $LblStat -Scope Global
-    Set-Variable -Name "Cmb${Prefix}ProjList" -Value $CmbProj -Scope Global
-    Set-Variable -Name "Cmb${Prefix}BucList" -Value $CmbBuc -Scope Global
-    Set-Variable -Name "Btn${Prefix}Loc" -Value $BtnLoc -Scope Global
-    Set-Variable -Name "Lbl${Prefix}Path" -Value $LblPth -Scope Global
-    Set-Variable -Name "Lbx${Prefix}Dir" -Value $Lbx -Scope Global
+    $CmbBuc.Add_Enter({ if ($this.Text -match "Type Bucket") { $this.Text = "" } })
+    $CmbBuc.Add_KeyDown({
+        param($sender, $e)
+        if ($e.KeyCode -eq 'Enter') {
+            $e.SuppressKeyPress = $true
+            $IsSource = ($sender -eq $Global:CmbSrcBucList)
+            $locProj = if ($IsSource) { $Global:CmbSrcProjList } else { $Global:CmbDstProjList }
+            $locLbx  = if ($IsSource) { $Global:LbxSrcDir } else { $Global:LbxDstDir }
+            if ($locProj.SelectedItem -eq "[ No Project ID (Manual) ]") {
+                $val = $sender.Text.Trim(); if (![string]::IsNullOrWhiteSpace($val) -and $val -notmatch "Type Bucket") {
+                    $locLbx.Enabled = $true
+                    if ($IsSource) { $Global:SrcPath = "" } else { $Global:DstPath = ""; $Global:BtnDstNewF.Enabled = $true; $Global:BtnDstRef.Enabled = $true }
+                    Update-Directory $IsSource
+                }
+            }
+        }
+    })
+    Set-Variable -Name "Cmb${Prefix}Provider" -Value $CmbProv -Scope Global; Set-Variable -Name "Btn${Prefix}Auth" -Value $BtnAu -Scope Global; Set-Variable -Name "Btn${Prefix}SignOut" -Value $BtnOut -Scope Global; Set-Variable -Name "Lbl${Prefix}AuthStatus" -Value $LblStat -Scope Global; Set-Variable -Name "Cmb${Prefix}ProjList" -Value $CmbProj -Scope Global; Set-Variable -Name "Cmb${Prefix}BucList" -Value $CmbBuc -Scope Global; Set-Variable -Name "Btn${Prefix}Loc" -Value $BtnLoc -Scope Global; Set-Variable -Name "Lbl${Prefix}Path" -Value $LblPth -Scope Global; Set-Variable -Name "Lbx${Prefix}Dir" -Value $Lbx -Scope Global
 }
 
 Build-BrowserPanel $SplitBrowsers.Panel1 "Source Storage:" "Src"
@@ -394,7 +423,7 @@ function Update-Theme {
 
     foreach ($cb in $AllDropdowns) { $cb.BackColor = $dropdownBg; $cb.ForeColor = $dropdownFg }
     
-    $ThemeBtns = @($BtnNewTask, $BtnDuplicate, $BtnDelTask, $BtnClearAll, $BtnSettings, $BtnSrcAuth, $BtnSrcLoc, $BtnSrcFile, $BtnSrcFilter, $BtnDstAuth, $BtnDstLoc, $BtnDstRef, $BtnDstNewF, $BtnCheckAll, $BtnUncheckAll, $BtnOpenLog)
+    $ThemeBtns = @($BtnNewTask, $BtnDuplicate, $BtnDelTask, $BtnClearAll, $BtnSettings, $BtnSrcAuth, $BtnSrcSignOut, $BtnSrcLoc, $BtnSrcFilter, $BtnDstAuth, $BtnDstSignOut, $BtnDstLoc, $BtnDstRef, $BtnDstNewF, $BtnCheckAll, $BtnUncheckAll, $BtnOpenLog)
     foreach ($btn in $ThemeBtns) { if($btn) { $btn.BackColor = $panelBg; $btn.ForeColor = $fg } }
 
     if ($Global:AppSettings.IsDarkMode) {
@@ -407,503 +436,165 @@ Update-Theme
 
 # --- BACKEND HELPERS ---
 function Log-Message([string]$msg, [string]$color = "LightGray") {
+    if ($null -eq $Global:FullLogLines) { $Global:FullLogLines = New-Object System.Collections.ArrayList }
+    [void]$Global:FullLogLines.Add($msg)
     $RtbLog.SelectionStart = $RtbLog.TextLength
     if (-not $Global:AppSettings.IsDarkMode -and $color -eq "LightGray") { $color = "Black" }
     if (-not $Global:AppSettings.IsDarkMode -and $color -eq "White") { $color = "DarkGray" }
     $RtbLog.SelectionColor = [System.Drawing.Color]::$color
     $RtbLog.AppendText("$msg`n"); $RtbLog.ScrollToCaret()
+    if ($RtbLog.Lines.Count -gt 150) {
+        $excess = $RtbLog.Lines.Count - 150
+        $cutPos = $RtbLog.GetFirstCharIndexFromLine($excess)
+        if ($cutPos -gt 0) {
+            $RtbLog.ReadOnly = $false
+            $RtbLog.Select(0, $cutPos)
+            $RtbLog.SelectedText = ""
+            $RtbLog.ReadOnly = $true
+        }
+    }
 }
 
+function New-BrowserListItem([int]$Type, [string]$Name, [DateTime]$RawDate = [DateTime]::MinValue, [string]$DisplayString = $null) {
+    if ([string]::IsNullOrWhiteSpace($DisplayString)) {
+        if ($Type -eq -1) {
+            $DisplayString = ".. [Go Up] | ---"
+        } elseif ($Type -eq 0) {
+            $dateStr = if ($RawDate -ne [DateTime]::MinValue) { $RawDate.ToString("yyyy-MM-dd HH:mm") } else { "---" }
+            $DisplayString = ("[DIR]  {0,-30} | {1}" -f $Name, $dateStr)
+        } elseif ($Type -eq 1) {
+            $dateStr = if ($RawDate -ne [DateTime]::MinValue) { $RawDate.ToString("yyyy-MM-dd HH:mm") } else { "---" }
+            $DisplayString = ("[FILE] {0,-30} | {1}" -f $Name, $dateStr)
+        } else {
+            $DisplayString = $Name
+        }
+    }
+
+    return [PSCustomObject]@{
+        Type = $Type
+        Name = $Name
+        RawDate = $RawDate
+        DisplayString = $DisplayString
+    }
+}
+
+# REFACTORED CLI EXECUTION: Uses native Invoke-Expression wrapper with robust JSON extraction
 function Execute-Cli-Json($cmdArgs, [bool]$isRclone = $false) {
-    if (Test-Path -LiteralPath $Global:JsonTempFile) { Remove-Item -LiteralPath $Global:JsonTempFile -Force -ErrorAction SilentlyContinue }
+    $exePath = if ($isRclone) { $Global:RcloneExe } else { if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" } }
     
-    if ($isRclone) { Invoke-Expression "& `"$Global:RcloneExe`" $cmdArgs > `"$Global:JsonTempFile`" 2> `$null" }
-    else { Invoke-Expression "$cmdArgs > `"$Global:JsonTempFile`" 2> `$null" }
+    $outData = ""
+    try {
+        $cmd = "& `"$exePath`" $cmdArgs 2>&1"
+        $outData = Invoke-Expression $cmd | Out-String
+    } catch {}
     
-    if (Test-Path -LiteralPath $Global:JsonTempFile) {
-        $raw = Get-Content -Raw -LiteralPath $Global:JsonTempFile
-        if (![string]::IsNullOrWhiteSpace($raw)) { try { return (ConvertFrom-Json -InputObject $raw) } catch { return $null } }
+    if (![string]::IsNullOrWhiteSpace($outData)) {
+        $outData = $outData.Trim()
+        $firstChar = $outData.IndexOfAny([char[]]('[', '{'))
+        $lastChar = $outData.LastIndexOfAny([char[]](']', '}'))
+        
+        if ($firstChar -ge 0 -and $lastChar -ge $firstChar) {
+            $jsonString = $outData.Substring($firstChar, $lastChar - $firstChar + 1)
+            try { return (ConvertFrom-Json -InputObject $jsonString) } catch { return $null }
+        }
     }
     return $null
 }
 
-function ConvertTo-ProcessArgument([string]$value) {
-    if ($null -eq $value -or $value.Length -eq 0) { return '""' }
-    if ($value -notmatch '[\s"]') { return $value }
-
-    $builder = New-Object System.Text.StringBuilder
-    [void]$builder.Append('"')
-    $backslashCount = 0
-
-    foreach ($char in $value.ToCharArray()) {
-        if ($char -eq '\') {
-            $backslashCount++
-            continue
-        }
-
-        if ($char -eq '"') {
-            if ($backslashCount -gt 0) { [void]$builder.Append(('\' * ($backslashCount * 2))) }
-            [void]$builder.Append('\"')
-            $backslashCount = 0
-            continue
-        }
-
-        if ($backslashCount -gt 0) {
-            [void]$builder.Append(('\' * $backslashCount))
-            $backslashCount = 0
-        }
-
-        [void]$builder.Append($char)
-    }
-
-    if ($backslashCount -gt 0) { [void]$builder.Append(('\' * ($backslashCount * 2))) }
-    [void]$builder.Append('"')
-    return $builder.ToString()
-}
-
-function Join-ProcessArguments([string[]]$arguments) {
-    if ($null -eq $arguments -or $arguments.Count -eq 0) { return "" }
-    return (($arguments | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' ')
-}
-
-function New-TransferCommand {
-    param(
-        [string]$ToolPath,
-        [string]$Source,
-        [string]$Destination,
-        [string[]]$ArgumentList,
-        [string]$WorkingDirectory = "",
-        [hashtable]$Environment = @{},
-        [string]$Description = ""
-    )
-
-    $command = [TransferCommand]::new()
-    $command.Source = $Source
-    $command.Destination = $Destination
-    $command.ToolPath = $ToolPath
-    $command.Arguments = Join-ProcessArguments $ArgumentList
-    $command.WorkingDirectory = $WorkingDirectory
-    $command.Environment = @{}
-    if ($Environment) {
-        foreach ($key in $Environment.Keys) { $command.Environment[$key] = [string]$Environment[$key] }
-    }
-    $command.Description = $Description
-    return $command
-}
-
-function Invoke-TransferJob {
-    param([TransferJob]$TransferJob)
-
-    $queue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
-    $state = [hashtable]::Synchronized(@{
-        StopRequested = $false
-        Completed = $false
-        ExitCode = $null
-        ProcessId = $null
-        ErrorMessage = $null
-    })
-
-    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $runspace.ApartmentState = [System.Threading.ApartmentState]::MTA
-    $runspace.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
-    $runspace.Open()
-
-    $ps = [PowerShell]::Create()
-    $ps.Runspace = $runspace
-    [void]$ps.AddScript({
-        param($job, $queueRef, $stateRef)
-
-        foreach ($command in $job.Commands) {
-            if ($stateRef.StopRequested) { break }
-
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = $command.ToolPath
-            $psi.Arguments = $command.Arguments
-            if (-not [string]::IsNullOrWhiteSpace($command.WorkingDirectory)) { $psi.WorkingDirectory = $command.WorkingDirectory }
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow = $true
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-
-            if ($command.Environment) {
-                foreach ($name in $command.Environment.Keys) {
-                    $psi.EnvironmentVariables[$name] = [string]$command.Environment[$name]
-                }
-            }
-
-            $process = New-Object System.Diagnostics.Process
-            $process.StartInfo = $psi
-            $process.EnableRaisingEvents = $true
-
-            $queueCopy = $queueRef
-            $descCopy = $command.Description
-
-            $stdOutHandler = [System.Diagnostics.DataReceivedEventHandler]{
-                param($sender, $eventArgs)
-                if (-not [string]::IsNullOrWhiteSpace($eventArgs.Data)) {
-                    $queueCopy.Enqueue([PSCustomObject]@{
-                        Type = "log"
-                        Stream = "stdout"
-                        Text = $eventArgs.Data
-                        ProcessId = $sender.Id
-                        Description = $descCopy
-                    })
-                }
-            }.GetNewClosure()
-
-            $stdErrHandler = [System.Diagnostics.DataReceivedEventHandler]{
-                param($sender, $eventArgs)
-                if (-not [string]::IsNullOrWhiteSpace($eventArgs.Data)) {
-                    $queueCopy.Enqueue([PSCustomObject]@{
-                        Type = "log"
-                        Stream = "stderr"
-                        Text = $eventArgs.Data
-                        ProcessId = $sender.Id
-                        Description = $descCopy
-                    })
-                }
-            }.GetNewClosure()
-
-            $process.add_OutputDataReceived($stdOutHandler)
-            $process.add_ErrorDataReceived($stdErrHandler)
-
-            try {
-                if (-not $process.Start()) { throw "Failed to start $($command.ToolPath)." }
-            } catch {
-                $stateRef.ErrorMessage = $_.Exception.Message
-                $stateRef.ExitCode = -1
-                $queueRef.Enqueue([PSCustomObject]@{
-                    Type = "log"
-                    Stream = "stderr"
-                    Text = $_.Exception.Message
-                    ProcessId = 0
-                    Description = $descCopy
-                })
-                break
-            }
-
-            $stateRef.ProcessId = $process.Id
-            $queueRef.Enqueue([PSCustomObject]@{
-                Type = "process-started"
-                Stream = ""
-                Text = $descCopy
-                ProcessId = $process.Id
-                Description = $descCopy
-            })
-
-            $process.BeginOutputReadLine()
-            $process.BeginErrorReadLine()
-
-            $stopIssued = $false
-            while (-not $process.WaitForExit(200)) {
-                if ($stateRef.StopRequested -and -not $stopIssued) {
-                    $stopIssued = $true
-                    try { Start-Process "taskkill.exe" -ArgumentList "/PID $($process.Id) /T /F" -WindowStyle Hidden -Wait | Out-Null } catch {}
-                }
-            }
-
-            $process.WaitForExit()
-            $stateRef.ProcessId = $null
-            $stateRef.ExitCode = $process.ExitCode
-
-            $queueRef.Enqueue([PSCustomObject]@{
-                Type = "process-exited"
-                Stream = ""
-                Text = $descCopy
-                ProcessId = $process.Id
-                ExitCode = $process.ExitCode
-                Description = $descCopy
-            })
-
-            $process.remove_OutputDataReceived($stdOutHandler)
-            $process.remove_ErrorDataReceived($stdErrHandler)
-            $process.Dispose()
-
-            if ($stateRef.StopRequested -or $stateRef.ExitCode -notin @(0, 1, 9)) { break }
-        }
-
-        $stateRef.Completed = $true
-        $finalExitCode = if ($null -ne $stateRef.ExitCode) { [int]$stateRef.ExitCode } elseif ($stateRef.StopRequested) { 9 } else { 0 }
-        $queueRef.Enqueue([PSCustomObject]@{
-            Type = "complete"
-            Stream = ""
-            Text = $stateRef.ErrorMessage
-            ProcessId = 0
-            ExitCode = $finalExitCode
-            Stopped = [bool]$stateRef.StopRequested
-        })
-    }).AddArgument($TransferJob).AddArgument($queue).AddArgument($state)
-
-    $asyncResult = $ps.BeginInvoke()
-
-    return [PSCustomObject]@{
-        Queue = $queue
-        State = $state
-        Runspace = $runspace
-        PowerShell = $ps
-        AsyncResult = $asyncResult
-    }
-}
-
-function Restore-TransferUiState {
-    $Global:IsTransferring = $false
-
-    $LvwTasks.BackColor = $InputColor
-    $ChkExclusions.BackColor = $InputColor
-    $LbxSrcDir.BackColor = $InputColor
-    $LbxDstDir.BackColor = $InputColor
-
-    $BtnNewTask.Enabled = $true; $BtnDelTask.Enabled = $true; $BtnClearAll.Enabled = $true; $BtnDuplicate.Enabled = $true
-    $BtnSrcLoc.Enabled = $true; $BtnSrcFilter.Enabled = $true; $BtnDstLoc.Enabled = $true; $BtnDstNewF.Enabled = $true; $BtnDstRef.Enabled = $true
-    $BtnUpload.Enabled = $true; $BtnCheckAll.Enabled = $true; $BtnUncheckAll.Enabled = $true
-    $BtnStop.Enabled = $false
-}
-
-function Stop-ActiveTransferProcess {
-    $context = $Global:ActiveTransfer
-    if (-not $context) { return }
-
-    $Global:StopTransfer = $true
-    if ($context.State) { $context.State.StopRequested = $true }
-
-    $processId = $null
-    if ($Global:CurrentProcess) {
-        try {
-            if (-not $Global:CurrentProcess.HasExited) { $processId = $Global:CurrentProcess.Id }
-        } catch {}
-    }
-    if (-not $processId -and $context.State) { $processId = $context.State.ProcessId }
-
-    if ($processId) {
-        try { Start-Process "taskkill.exe" -ArgumentList "/PID $processId /T /F" -WindowStyle Hidden -Wait | Out-Null } catch {}
-    }
-}
-
-function Update-TransferUiFromLine {
-    param(
-        [pscustomobject]$Context,
-        [string]$Line,
-        [string]$Stream = "stdout"
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Line)) { return }
-
-    $trimmedLine = $Line.Trim()
-    $logColor = if ($Stream -eq "stderr") { "LightCoral" } else { "White" }
-    Log-Message $trimmedLine $logColor
-
-    if ($Context.RunLogFile) {
-        [System.IO.File]::AppendAllText($Context.RunLogFile, $trimmedLine + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding $false))
-    }
-
-    $isUpdate = $false
-
-    if ($trimmedLine -match "(?i)userRateLimitExceeded|upload limit error|quota exceeded|RATE_LIMIT_EXCEEDED|rateLimitExceeded") {
-        if (-not $Context.QuotaReached) {
-            Log-Message "QUOTA LIMIT REACHED. Transfer safely stopped." "Yellow"
-            $Context.QuotaReached = $true
-            Stop-ActiveTransferProcess
-        }
-    }
-
-    if ($trimmedLine -match 'Transferred:.*?,\s*(\d{1,3})%,\s*([\d\.]+\s*[kKMGT]?i?B/s)') {
-        $pct = [int]$Matches[1]
-        $Global:TransferSpeed = $Matches[2]
-        if ($pct -ge 0 -and $pct -le 100) {
-            $PrgTotal.Style = "Continuous"
-            if ($pct -lt 100 -and $pct -gt 0) { $PrgTotal.Value = $pct + 1; $PrgTotal.Value = $pct } else { $PrgTotal.Value = $pct }
-            $LblProgress.Text = "Progress ($($Context.DisplayName)): $pct%"
-        }
-    }
-
-    if ($trimmedLine -match '^Transferred:\s+(\d+)\s*/\s*(\d+),\s*\d{1,3}%$') {
-        $LblFolderCount.Text = "Item(s): $($Matches[1]) out of $($Matches[2])"
-    }
-
-    if ($trimmedLine -match "(?i)INFO\s+:\s+(.+?):\s+Copied" -or $trimmedLine -match "Copying file://(.+?)\s+to\s+(gs://[^\s]+)" -or $trimmedLine -match "Copying gs://(.+?)\s+to\s+(.+)") {
-        $Context.RegCopied++
-        [void]$Context.ReportLog.Add("[COPIED]  $($Matches[1])")
-        $isUpdate = $true
-    }
-    elseif ($trimmedLine -match "(?i)INFO\s+:\s+(.+?):\s+Unchanged skipping" -or $trimmedLine -match "Skipping existing(?: destination)? item\s+(.+)") {
-        $isUpdate = $true
-    }
-    elseif ($trimmedLine -match "(?i)ERROR\s+:\s+(.+?):\s+(.+)") {
-        $Context.RegFailed++
-        [void]$Context.ReportLog.Add("[FAILED]  $($Matches[1]) -> $($Matches[2])")
-        $isUpdate = $true
-    }
-    elseif ($trimmedLine -match "ERROR:\s+(.+)") {
-        $Context.RegFailed++
-        [void]$Context.ReportLog.Add("[FAILED]  $($Matches[1])")
-        $isUpdate = $true
-    }
-    elseif ($trimmedLine -match "(?i)CRITICAL(.*?):\s+(.+)") {
-        $Context.RegFailed++
-        [void]$Context.ReportLog.Add("[CRITICAL] $($Matches[2])")
-        $isUpdate = $true
-    }
-
-    if ($isUpdate) {
-        $totalProcessed = $Context.RegCopied + $Context.RegFailed
-        if ($Context.TotalSourceItems -gt 0) {
-            $pct = [math]::Round(($totalProcessed / $Context.TotalSourceItems) * 100)
-            if ($pct -gt 100) { $pct = 100 }
-            $PrgTotal.Style = "Continuous"
-            if ($pct -lt 100 -and $pct -gt 0) { $PrgTotal.Value = $pct + 1; $PrgTotal.Value = $pct } else { $PrgTotal.Value = $pct }
-            $LblProgress.Text = "Progress ($($Context.DisplayName)): $pct%"
-            $LblFolderCount.Text = "Item(s): $totalProcessed out of $($Context.TotalSourceItems)"
-        } else {
-            $LblFolderCount.Text = "Item(s) Processed: $totalProcessed"
-        }
-    }
-}
-
-function Complete-TransferJob {
-    param([pscustomobject]$Context)
-
-    if (-not $Context -or $Context.Finalized) { return }
-    $Context.Finalized = $true
-
-    if ($Global:TransferUiTimer) { $Global:TransferUiTimer.Stop() }
-
-    if ($Context.AsyncResult) {
-        try { $null = $Context.PowerShell.EndInvoke($Context.AsyncResult) } catch {
-            $Context.ProcessFailed = $true
-            if (-not $Context.QuotaReached) { Log-Message "Transfer worker failed: $($_.Exception.Message)" "LightCoral" }
-        }
-    }
-
-    if ($Context.PowerShell) { $Context.PowerShell.Dispose() }
-    if ($Context.Runspace) {
-        $Context.Runspace.Close()
-        $Context.Runspace.Dispose()
-    }
-
-    $exitCode = if ($null -ne $Context.ExitCode) { [int]$Context.ExitCode } elseif ($Context.State -and $null -ne $Context.State.ExitCode) { [int]$Context.State.ExitCode } elseif ($Global:StopTransfer) { 9 } else { 0 }
-    if ($exitCode -notin @(0, 1, 9)) {
-        $Context.ProcessFailed = $true
-        if (-not $Context.QuotaReached) { Log-Message "Process finished with errors (Exit Code: $exitCode). Review log above." "LightCoral" }
-    }
-
-    $PrgTotal.Style = "Continuous"
-    if ($Global:StopTransfer) {
-        if ($PrgTotal.Value -gt 100) { $PrgTotal.Value = 100 }
-        $LblProgress.Text = "Transfer Aborted"
-    } else {
-        $PrgTotal.Value = 100
-        $LblProgress.Text = "Progress (Complete) ================= 100%"
-    }
-
-    $totalSourceItems = $Context.TotalSourceItems
-    $regSkipped = if ($totalSourceItems -gt 0) { [math]::Max(0, ($totalSourceItems - $Context.RegCopied - $Context.RegFailed)) } else { 0 }
-    $totalProcessed = $Context.RegCopied + $Context.RegFailed
-    if ($LblFolderCount.Text -match "Calculating" -or $totalSourceItems -gt 0) {
-        $LblFolderCount.Text = "Item(s) Processed: $totalProcessed"
-    }
-
-    $Context.Stopwatch.Stop()
-
-    $cleanTaskName = $TxtTaskName.Text -replace '[\\/:*?"<>|]', '_'
-    $logDir = "C:\data_transfer_log\"
-    if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-    $logPath = Join-Path $logDir "${cleanTaskName}_$($Context.StartTimeSafe).txt"
-
-    $cleanLogString = $Context.ReportLog -join [Environment]::NewLine
-    $finalStatus = if ($Context.QuotaReached) { "Error" } elseif ($Global:StopTransfer) { "Aborted" } elseif ($Context.RegFailed -gt 0 -or $Context.ProcessFailed) { "Error" } else { "Completed" }
-
-    $summary = @"
-=================================================
-AUDIT SUMMARY: Data Transfer Tool
-=================================================
-Task Name: $($TxtTaskName.Text)
-Status: $finalStatus
-Duration: $($Context.Stopwatch.Elapsed.ToString("hh\:mm\:ss"))
-Source: $Global:SrcProvider | Dest: $Global:DstProvider
-Exit Code: $exitCode
-Average Speed: $Global:TransferSpeed
-
-METRICS:
-- Total Items in Source: $totalSourceItems
-- Copied: $($Context.RegCopied)
-- Skipped: $regSkipped
-- Failed: $($Context.RegFailed)
-
-=================================================
-DETAILED TRANSFER LOG:
-=================================================
-$cleanLogString
-"@
-
-    $summary | Out-File -LiteralPath $logPath -Encoding utf8
-    Log-Message "`r`nSummary File Saved: $logPath" "Cyan"
-
-    if ($Global:CurrentTaskId) {
-        for ($i = 0; $i -lt $Global:Tasks.Count; $i++) {
-            if ($Global:Tasks[$i].Id -eq $Global:CurrentTaskId) {
-                $Global:Tasks[$i].Status = $finalStatus
-                $Global:Tasks[$i].CompleteDate = (Get-Date -Format "MM/dd/yyyy HH:mm")
-                $Global:Tasks[$i].LogData = $RtbLog.Text
-                $Global:Tasks[$i].LogFilePath = $logPath
-                break
-            }
-        }
-        Save-Tasks
-        Sync-TasksToUI
-    }
+function Execute-Cli-Text($cmdArgs, [bool]$isRclone = $false) {
+    $exePath = if ($isRclone) { $Global:RcloneExe } else { if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" } }
 
     try {
-        if ($Context.Job -and $Context.Job.ExcludeFile -and (Test-Path -LiteralPath $Context.Job.ExcludeFile)) {
-            Remove-Item -LiteralPath $Context.Job.ExcludeFile -Force -ErrorAction SilentlyContinue
-        }
-    } catch {}
-
-    $Global:CurrentProcess = $null
-    $Global:ActiveTransfer = $null
-    Restore-TransferUiState
+        $cmd = "& `"$exePath`" $cmdArgs 2>&1"
+        return (Invoke-Expression $cmd | Out-String)
+    } catch {
+        return ""
+    }
 }
 
-$Global:TransferUiTimer = New-Object System.Windows.Forms.Timer
-$Global:TransferUiTimer.Interval = 150
-$Global:TransferUiTimer.Add_Tick({
-    $context = $Global:ActiveTransfer
-    if (-not $context) {
-        $Global:TransferUiTimer.Stop()
-        return
+function Execute-Gsutil-Result($cmdArgs) {
+    $gsutilCmd = $null
+    try { $gsutilCmd = Get-Command "gsutil.cmd" -ErrorAction Stop } catch {}
+    if (-not $gsutilCmd) {
+        try { $gsutilCmd = Get-Command "gsutil" -ErrorAction Stop } catch {}
     }
 
-    $entry = $null
-    $processed = 0
-    while ($processed -lt 250 -and $context.Queue.TryDequeue([ref]$entry)) {
-        $processed++
+    if (-not $gsutilCmd) {
+        return [PSCustomObject]@{ ExitCode = -1; Output = "gsutil not found"; Command = "gsutil $cmdArgs" }
+    }
 
-        switch ($entry.Type) {
-            "process-started" {
-                try { $Global:CurrentProcess = [System.Diagnostics.Process]::GetProcessById($entry.ProcessId) } catch { $Global:CurrentProcess = $null }
-            }
-            "process-exited" {
-                $context.ExitCode = $entry.ExitCode
-                $Global:CurrentProcess = $null
-            }
-            "log" {
-                Update-TransferUiFromLine -Context $context -Line $entry.Text -Stream $entry.Stream
-            }
-            "complete" {
-                $context.ExitCode = $entry.ExitCode
-                if ($entry.Stopped) { $Global:StopTransfer = $true }
-                if (-not [string]::IsNullOrWhiteSpace($entry.Text) -and -not $context.QuotaReached) {
-                    Log-Message $entry.Text "LightCoral"
+    $outData = ""
+    $exitCode = -1
+    try {
+        $cmd = "& `"$($gsutilCmd.Source)`" $cmdArgs 2>&1"
+        $outData = Invoke-Expression $cmd | Out-String
+        $exitCode = $LASTEXITCODE
+    } catch {
+        $outData = ""
+        $exitCode = -1
+    }
+
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Output = if ($outData) { $outData } else { "" }
+        Command = "$($gsutilCmd.Source) $cmdArgs"
+    }
+}
+
+# Returns a status label that reflects which OAuth credentials are active in the rclone config.
+# Reads the persisted rclone config after auth so the answer is always definitive.
+function Get-DriveAuthLabel {
+    try {
+        if (Test-Path -LiteralPath $Global:TempConfig) {
+            $cfg = Get-Content -LiteralPath $Global:TempConfig -Raw
+            # Find the [GWorkspaceAuth] section and check for a non-empty client_id line
+            if ($cfg -match "(?ms)\[$([regex]::Escape($Global:RemoteName))\].*?client_id\s*=\s*([^\r\n]+)") {
+                $storedId = $Matches[1].Trim()
+                if (-not [string]::IsNullOrWhiteSpace($storedId)) {
+                    return "Auth (GDrive - Custom ID)"
                 }
             }
         }
+    } catch {}
+    return "Auth (GDrive - Built-in)"
+}
+
+function Execute-Cli-Result($cmdArgs, [bool]$isRclone = $false) {
+    $exePath = if ($isRclone) { $Global:RcloneExe } else { if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" } }
+
+    $outData = ""
+    $exitCode = -1
+    try {
+        $cmd = "& `"$exePath`" $cmdArgs 2>&1"
+        $outData = Invoke-Expression $cmd | Out-String
+        $exitCode = $LASTEXITCODE
+    } catch {
+        $outData = ""
+        $exitCode = -1
     }
 
-    if ($context.State.Completed -and $context.Queue.IsEmpty -and -not $context.Finalized) {
-        Complete-TransferJob -Context $context
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Output = if ($outData) { $outData } else { "" }
+        Command = "$exePath $cmdArgs"
     }
-})
+}
+
+function Get-GcsProjectArg([object]$ProjectValue) {
+    if (-not [string]::IsNullOrWhiteSpace($ProjectValue) -and $ProjectValue -notmatch "No Project") {
+        return "--project=`"$ProjectValue`""
+    }
+    return ""
+}
+
+function Get-SourceLeafName {
+    if (-not $Global:SrcIsFile) { return "" }
+    if ($Global:SrcProvider -eq "LOCAL") {
+        return (Split-Path $Global:SrcLocalPath -Leaf)
+    }
+    if ([string]::IsNullOrWhiteSpace($Global:SrcPath)) { return "" }
+    return (($Global:SrcPath.TrimEnd('/') -split '/')[-1])
+}
 
 function Is-Filtered([string]$name) {
     $sysRegex = '(?i)^(desktop\.ini|thumbs\.db|\$RECYCLE\.BIN|System Volume Information|pagefile\.sys|hiberfil\.sys|swapfile\.sys|\$SysReset|\$Windows\.~BT|\$Windows\.~WS|\$WinREAgent)$'
@@ -1016,7 +707,7 @@ $BtnSrcFilter.Add_Click({ Show-FilterDialog })
 function Show-SettingsDialog {
     $SF = New-Object System.Windows.Forms.Form
     $SF.Text = "Configuration Settings"
-    $SF.Size = New-Object System.Drawing.Size(530, 320); $SF.StartPosition = "CenterParent"; $SF.FormBorderStyle = "FixedDialog"; $SF.MaximizeBox = $false; $SF.MinimizeBox = $false
+    $SF.Size = New-Object System.Drawing.Size(530, 430); $SF.StartPosition = "CenterParent"; $SF.FormBorderStyle = "FixedDialog"; $SF.MaximizeBox = $false; $SF.MinimizeBox = $false
     $SF.BackColor = $Form.BackColor; $SF.ForeColor = $Form.ForeColor
     
     $lblR = New-Object System.Windows.Forms.Label; $lblR.Text = "Rclone.exe Path:"; $lblR.Location = New-Object System.Drawing.Point(15, 20); $lblR.AutoSize = $true; $SF.Controls.Add($lblR)
@@ -1042,9 +733,27 @@ function Show-SettingsDialog {
 
     $lblTWarn = New-Object System.Windows.Forms.Label; $lblTWarn.Text = "Note: Using 4 or more threads on Google Drive may trigger 403 Rate Limit Quota Exceeded errors. 4+ threads are recommended for Local-to-Local transfers only."; $lblTWarn.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic); $lblTWarn.ForeColor = if ($Global:AppSettings.IsDarkMode) { [System.Drawing.Color]::LightCoral } else { [System.Drawing.Color]::IndianRed }; $lblTWarn.Location = New-Object System.Drawing.Point(15, 185); $lblTWarn.Size = New-Object System.Drawing.Size(485, 30); $SF.Controls.Add($lblTWarn)
 
-    $btnSave = New-Object System.Windows.Forms.Button; $btnSave.Text = "Save & Apply"; $btnSave.Location = New-Object System.Drawing.Point(120, 230); $btnSave.Size = New-Object System.Drawing.Size(120, 30); $btnSave.FlatStyle="Flat"; $btnSave.FlatAppearance.BorderSize=1; $btnSave.FlatAppearance.BorderColor=[System.Drawing.Color]::Gray; $btnSave.BackColor = $BtnSettings.BackColor; $btnSave.ForeColor = $BtnSettings.ForeColor; $SF.Controls.Add($btnSave)
+    # --- Google Drive API credentials section ---
+    $lblDivider = New-Object System.Windows.Forms.Label; $lblDivider.Text = "Google Drive API - Custom OAuth Client (Optional):"; $lblDivider.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold); $lblDivider.Location = New-Object System.Drawing.Point(15, 225); $lblDivider.AutoSize = $true; $SF.Controls.Add($lblDivider)
+
+    $lblDriveNote = New-Object System.Windows.Forms.Label
+    $lblDriveNote.Text = "Optional. Leave blank to use rclone's shared built-in credentials. To use a custom Client ID: enter the values below, click Save & Apply, then click Login/Auth to re-authenticate. No manual Sign Out step is required. See: rclone.org/drive/#making-your-own-client-id"
+    $lblDriveNote.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+    $lblDriveNote.ForeColor = if ($Global:AppSettings.IsDarkMode) { [System.Drawing.Color]::LightGray } else { [System.Drawing.Color]::DimGray }
+    $lblDriveNote.Location = New-Object System.Drawing.Point(15, 245); $lblDriveNote.Size = New-Object System.Drawing.Size(485, 30); $SF.Controls.Add($lblDriveNote)
+
+    $lblCId = New-Object System.Windows.Forms.Label; $lblCId.Text = "Client ID:"; $lblCId.Location = New-Object System.Drawing.Point(15, 280); $lblCId.AutoSize = $true; $SF.Controls.Add($lblCId)
+    $txtCId = New-Object System.Windows.Forms.TextBox; $txtCId.Location = New-Object System.Drawing.Point(120, 277); $txtCId.Size = New-Object System.Drawing.Size(390, 20); $txtCId.Text = $Global:AppSettings.DriveClientId; $txtCId.BackColor = $TxtTaskName.BackColor; $txtCId.ForeColor = $TxtTaskName.ForeColor; $txtCId.BorderStyle = "FixedSingle"; $SF.Controls.Add($txtCId)
+
+    $lblCSec = New-Object System.Windows.Forms.Label; $lblCSec.Text = "Client Secret:"; $lblCSec.Location = New-Object System.Drawing.Point(15, 308); $lblCSec.AutoSize = $true; $SF.Controls.Add($lblCSec)
+    $txtCSec = New-Object System.Windows.Forms.TextBox; $txtCSec.Location = New-Object System.Drawing.Point(120, 305); $txtCSec.Size = New-Object System.Drawing.Size(390, 20); $txtCSec.Text = $Global:AppSettings.DriveClientSecret; $txtCSec.BackColor = $TxtTaskName.BackColor; $txtCSec.ForeColor = $TxtTaskName.ForeColor; $txtCSec.BorderStyle = "FixedSingle"; $txtCSec.UseSystemPasswordChar = $true; $SF.Controls.Add($txtCSec)
+
+    $chkShowSec = New-Object System.Windows.Forms.CheckBox; $chkShowSec.Text = "Show Secret"; $chkShowSec.Location = New-Object System.Drawing.Point(15, 330); $chkShowSec.AutoSize = $true; $chkShowSec.ForeColor = if ($Global:AppSettings.IsDarkMode) { [System.Drawing.Color]::LightGray } else { [System.Drawing.Color]::DimGray }; $SF.Controls.Add($chkShowSec)
+    $chkShowSec.Add_CheckedChanged({ $txtCSec.UseSystemPasswordChar = -not $chkShowSec.Checked })
+
+    $btnSave = New-Object System.Windows.Forms.Button; $btnSave.Text = "Save & Apply"; $btnSave.Location = New-Object System.Drawing.Point(120, 360); $btnSave.Size = New-Object System.Drawing.Size(120, 30); $btnSave.FlatStyle="Flat"; $btnSave.FlatAppearance.BorderSize=1; $btnSave.FlatAppearance.BorderColor=[System.Drawing.Color]::Gray; $btnSave.BackColor = $BtnSettings.BackColor; $btnSave.ForeColor = $BtnSettings.ForeColor; $SF.Controls.Add($btnSave)
     
-    $btnHelp = New-Object System.Windows.Forms.Button; $btnHelp.Text = "Help / Guide"; $btnHelp.Location = New-Object System.Drawing.Point(260, 230); $btnHelp.Size = New-Object System.Drawing.Size(120, 30); $btnHelp.FlatStyle="Flat"; $btnHelp.FlatAppearance.BorderSize=1; $btnHelp.FlatAppearance.BorderColor=[System.Drawing.Color]::Gray; $btnHelp.BackColor = $BtnSettings.BackColor; $btnHelp.ForeColor = $BtnSettings.ForeColor; $SF.Controls.Add($btnHelp)
+    $btnHelp = New-Object System.Windows.Forms.Button; $btnHelp.Text = "Help / Guide"; $btnHelp.Location = New-Object System.Drawing.Point(260, 360); $btnHelp.Size = New-Object System.Drawing.Size(120, 30); $btnHelp.FlatStyle="Flat"; $btnHelp.FlatAppearance.BorderSize=1; $btnHelp.FlatAppearance.BorderColor=[System.Drawing.Color]::Gray; $btnHelp.BackColor = $BtnSettings.BackColor; $btnHelp.ForeColor = $BtnSettings.ForeColor; $SF.Controls.Add($btnHelp)
     
     $btnBR.Add_Click({ $fd = New-Object System.Windows.Forms.OpenFileDialog; $fd.Filter = "Executable (*.exe)|*.exe"; if ($fd.ShowDialog() -eq "OK") { $txtR.Text = $fd.FileName } })
     $btnBG.Add_Click({ $fb = New-Object System.Windows.Forms.FolderBrowserDialog; if ($fb.ShowDialog() -eq "OK") { $txtG.Text = $fb.SelectedPath } })
@@ -1054,46 +763,185 @@ function Show-SettingsDialog {
         $Global:AppSettings.GCloudPath = $txtG.Text
         $Global:AppSettings.IsDebugMode = $chkDebug.Checked
         $Global:AppSettings.TransferThreads = $cmbT.SelectedItem
+        $Global:AppSettings.DriveClientId = $txtCId.Text.Trim()
+        $Global:AppSettings.DriveClientSecret = $txtCSec.Text.Trim()
         Save-Settings; Set-RcloneEnvironment; Set-GCloudEnvironment
         [System.Windows.Forms.MessageBox]::Show("Settings saved.", "Settings Saved") | Out-Null; $SF.Close() 
     })
     $SF.ShowDialog() | Out-Null
 }
 
-function Get-CloudItems([string]$Prov, [string]$Buc, [string]$Pth, [bool]$DirOnly=$false) {
-    $parsed = @(); $seen = @{}
+# REFACTORED: Now correctly accepts $IsSrc to map the exact Project ID needed to authenticate restricted buckets
+function Get-CloudItems([string]$Prov, [string]$Buc, [string]$Pth, [bool]$DirOnly, [bool]$IsSrc) {
+    $parsed = New-Object System.Collections.ArrayList; $seen = @{}
     if ($Prov -eq "GCS") {
+        function Normalize-GcsCandidatePath([string]$LineValue) {
+            $line = if ($LineValue) { $LineValue.Trim() } else { "" }
+            if ([string]::IsNullOrWhiteSpace($line)) { return "" }
+
+            if ($line -match '(?i)^(NAME|UPDATED|SIZE|ETAG|GENERATION|METAGENERATION)$') { return "" }
+            if ($line -match '^(ERROR:|WARNING:|Operation\s+failed|AccessDenied|PERMISSION_DENIED|Requester Pays|At line:|\+\s|FullyQualifiedErrorId|CategoryInfo|CommandNotFoundException|Traceback)') { return "" }
+
+            if ($line -match '^gs://') {
+                return $line
+            }
+
+            if ($line -match '^https?://storage.googleapis.com/([^\s]+)$') {
+                return ("gs://{0}" -f $Matches[1])
+            }
+
+            # Fallback for tabular object output where only relative object names are printed.
+            if ($line -notmatch '^[-=]+$' -and $line -notmatch '^\d{4}-\d{2}-\d{2}\s') {
+                $candidate = $line.TrimStart('/')
+                if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                    return ("gs://{0}/{1}" -f $Buc, $candidate)
+                }
+            }
+
+            return ""
+        }
+
+        function Add-GcsPathItem([string]$CandidatePath, [DateTime]$RawDate = [DateTime]::MinValue) {
+            $normalizedCandidate = Normalize-GcsCandidatePath $CandidatePath
+            if ([string]::IsNullOrWhiteSpace($normalizedCandidate) -or $normalizedCandidate -notmatch '^gs://') { return }
+
+            $bucketPrefix = "gs://$Buc/"
+            if ($normalizedCandidate.StartsWith($bucketPrefix)) {
+                $clean = $normalizedCandidate.Substring($bucketPrefix.Length)
+            } elseif ($normalizedCandidate -eq ("gs://$Buc")) {
+                $clean = ""
+            } else {
+                return
+            }
+            if ($clean -eq $Pth -or [string]::IsNullOrWhiteSpace($clean)) { return }
+
+            $relativePath = $clean
+            if (![string]::IsNullOrEmpty($Pth) -and $relativePath.StartsWith($Pth)) {
+                $relativePath = $relativePath.Substring($Pth.Length)
+            }
+            $relativePath = $relativePath.TrimStart('/')
+            if ([string]::IsNullOrWhiteSpace($relativePath)) { return }
+
+            if ($relativePath -match '/') {
+                $leaf = ($relativePath -split '/')[0] + "/"
+                if (-not $seen[$leaf]) {
+                    $seen[$leaf] = $true
+                    [void]$parsed.Add((New-BrowserListItem -Type 0 -Name $leaf -RawDate $RawDate))
+                }
+            } else {
+                if ($DirOnly) { return }
+                $leaf = $relativePath
+                if ($leaf -eq ".placeholder") { return }
+                if ([string]::IsNullOrWhiteSpace($leaf)) { return }
+                if (-not $seen[$leaf]) {
+                    $seen[$leaf] = $true
+                    [void]$parsed.Add((New-BrowserListItem -Type 1 -Name $leaf -RawDate $RawDate))
+                }
+            }
+        }
+
+        $Proj = if ($IsSrc) { $Global:CmbSrcProjList.SelectedItem } else { $Global:CmbDstProjList.SelectedItem }
+        $projArg = Get-GcsProjectArg $Proj
+
         $fullUri = "gs://$Buc/$Pth"
-        $result = Execute-Cli-Json -cmdArgs "gcloud.cmd storage ls `"$fullUri*`" --json" -isRclone $false
-        if ($result) {
-            foreach ($obj in $result) {
-                $pathStr = if ($obj.name) { $obj.name } else { $obj.url }
-                $clean = $pathStr -replace "^gs://$Buc/", ""
-                if ($clean -eq $Pth) { continue }
-                $relativePath = $clean; if (![string]::IsNullOrEmpty($Pth)) { $relativePath = $clean -replace "^$([regex]::Escape($Pth))", "" }
-                $upd = if ($obj.metadata.updated) { $obj.metadata.updated } elseif ($obj.updated) { $obj.updated } else { $null }
-                $rawDate = if ($upd) { try { [DateTime]::Parse($upd) } catch { [DateTime]::MinValue } } else { [DateTime]::MinValue }
-                $dateStr = if ($upd -and $rawDate -ne [DateTime]::MinValue) { $rawDate.ToString("yyyy-MM-dd HH:mm") } else { "---" }
-                
-                if ($relativePath -match '/') {
-                    $leaf = ($relativePath -split '/')[0] + "/"
-                    if (-not $seen[$leaf]) { $seen[$leaf] = $true; $parsed += [PSCustomObject]@{ Type = 0; Name = $leaf; RawDate = $rawDate; DisplayString = ("[DIR]  {0,-30} | {1}" -f $leaf, $dateStr) } }
-                } else {
-                    if ($DirOnly) { continue }
-                    $leaf = ($relativePath -split '#')[0] 
-                    if ($leaf -eq ".placeholder") { continue }
-                    if (-not $seen[$leaf]) { $seen[$leaf] = $true; $parsed += [PSCustomObject]@{ Type = 1; Name = $leaf; RawDate = $rawDate; DisplayString = ("[FILE] {0,-30} | {1}" -f $leaf, $dateStr) } }
+        if (-not $fullUri.EndsWith('/')) { $fullUri += '/' }
+
+        $lastGcsDiag = @()
+        
+        # gcloud storage ls supports only --format=gsutil in some SDK versions, so parse plain output.
+        $lsRes = Execute-Cli-Result -cmdArgs (("storage ls `"$fullUri`" {0}" -f $projArg).Trim()) -isRclone $false
+        $lastGcsDiag += $lsRes
+        if ($lsRes.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($lsRes.Output)) {
+            $rawLines = $lsRes.Output -split "`r?`n"
+            foreach ($raw in $rawLines) {
+                Add-GcsPathItem -CandidatePath $raw.Trim()
+            }
+        }
+
+        if ($parsed.Count -eq 0) {
+            # Secondary fallback using object listing for SDK variants where ls output is sparse.
+            $prefixArg = ""
+            $trimmedPrefix = $Pth.Trim('/')
+            if (-not [string]::IsNullOrWhiteSpace($trimmedPrefix)) {
+                $prefixArg = "--prefix=`"$trimmedPrefix/`""
+            }
+
+            $objCmd = (("storage objects list `"gs://$Buc`" {0} {1} --format=json(name,updated)" -f $prefixArg, $projArg).Trim())
+            $objRes = Execute-Cli-Json -cmdArgs $objCmd -isRclone $false
+            if ($objRes) {
+                $oArray = if ($objRes -is [array]) { $objRes } else { @($objRes) }
+                foreach ($obj in $oArray) {
+                    $objName = if ($obj.name) { [string]$obj.name } else { "" }
+                    if ([string]::IsNullOrWhiteSpace($objName)) { continue }
+                    $updated = if ($obj.updated) { [string]$obj.updated } else { "" }
+                    $rawDate = if (-not [string]::IsNullOrWhiteSpace($updated)) { try { [DateTime]::Parse($updated) } catch { [DateTime]::MinValue } } else { [DateTime]::MinValue }
+
+                    Add-GcsPathItem -CandidatePath ("gs://{0}/{1}" -f $Buc, $objName) -RawDate $rawDate
+                }
+            } else {
+                $objListRes = Execute-Cli-Result -cmdArgs (("storage objects list `"gs://$Buc`" {0} {1}" -f $prefixArg, $projArg).Trim()) -isRclone $false
+                $lastGcsDiag += $objListRes
+                if ($objListRes.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($objListRes.Output)) {
+                    foreach ($raw in ($objListRes.Output -split "`r?`n")) {
+                        Add-GcsPathItem -CandidatePath $raw.Trim()
+                    }
+                }
+            }
+        }
+
+        if ($parsed.Count -eq 0) {
+            # Legacy fallback for environments where gcloud storage commands are unavailable.
+            $gsutilUri = "gs://$Buc"
+            $trimmedPrefix = $Pth.Trim('/')
+            if (-not [string]::IsNullOrWhiteSpace($trimmedPrefix)) { $gsutilUri = "gs://$Buc/$trimmedPrefix" }
+            if (-not $gsutilUri.EndsWith('/')) { $gsutilUri += '/' }
+
+            $gsRes = Execute-Gsutil-Result -cmdArgs ("ls `"$gsutilUri`"")
+            $lastGcsDiag += $gsRes
+            if ($gsRes.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($gsRes.Output)) {
+                foreach ($raw in ($gsRes.Output -split "`r?`n")) {
+                    Add-GcsPathItem -CandidatePath $raw.Trim()
+                }
+            }
+
+            if ($parsed.Count -eq 0) {
+                $gsRecRes = Execute-Gsutil-Result -cmdArgs ("ls -r `"$gsutilUri**`"")
+                $lastGcsDiag += $gsRecRes
+                if ($gsRecRes.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($gsRecRes.Output)) {
+                    foreach ($raw in ($gsRecRes.Output -split "`r?`n")) {
+                        Add-GcsPathItem -CandidatePath $raw.Trim()
+                    }
+                }
+            }
+        }
+
+        if ($Global:AppSettings.IsDebugMode -and $parsed.Count -eq 0) {
+            Log-Message "DEBUG: GCS listing returned no visible entries for $fullUri" "Yellow"
+            foreach ($diag in $lastGcsDiag) {
+                if ($null -eq $diag) { continue }
+                Log-Message ("DEBUG: GCS command exit={0} :: {1}" -f $diag.ExitCode, $diag.Command) "Yellow"
+                if (-not [string]::IsNullOrWhiteSpace($diag.Output)) {
+                    $preview = ($diag.Output -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 3)
+                    foreach ($pLine in $preview) {
+                        Log-Message ("DEBUG: {0}" -f $pLine.Trim()) "DarkGray"
+                    }
                 }
             }
         }
     } elseif ($Prov -eq "GDRIVE") {
+        # FIXED: Bind Team Drive ID directly to the connection string to decouple My Drive from Shared Drives
         $target = "${Global:RemoteName}:${Pth}"
+        if ($Buc -and $Global:DriveMap.ContainsKey($Buc)) {
+            $target = "${Global:RemoteName},team_drive=$($Global:DriveMap[$Buc]):${Pth}"
+        }
+        
         $args = "lsjson `"$target`" --config `"$Global:TempConfig`" --tpslimit 8 --fast-list --drive-use-trash=false --drive-skip-shortcuts --drive-list-chunk=1000"
-        if ($Buc) { $args += " --drive-team-drive=`"$($Global:DriveMap[$Buc])`"" }
         if ($DirOnly) { $args += " --dirs-only" }
+        
         $result = Execute-Cli-Json -cmdArgs $args -isRclone $true
         if ($result) { 
-            foreach ($item in $result) { 
+            $rArray = if ($result -is [array]) { $result } else { @($result) }
+            foreach ($item in $rArray) { 
                 $rawDate = if ($item.ModTime) { try { [DateTime]::Parse($item.ModTime) } catch { [DateTime]::MinValue } } else { [DateTime]::MinValue }
                 $dateStr = if ($item.ModTime -and $rawDate -ne [DateTime]::MinValue) { $rawDate.ToString("yyyy-MM-dd HH:mm") } else { "---" }
                 if ($item.IsDir) { 
@@ -1121,13 +969,16 @@ function Update-Directory([bool]$IsSrc) {
     $LblP = if ($IsSrc) { $LblSrcPath } else { $LblDstPath }
 
     $Lbx.Items.Clear()
-    if (![string]::IsNullOrEmpty($Pth) -or ($Prov -eq "LOCAL" -and ![string]::IsNullOrEmpty($LocP) -and $LocP.Contains("\"))) { [void]$Lbx.Items.Add(".. [Go Up] | ---") }
+    if (![string]::IsNullOrEmpty($Pth) -or ($Prov -eq "LOCAL" -and ![string]::IsNullOrEmpty($LocP) -and $LocP.Contains("\"))) {
+        [void]$Lbx.Items.Add((New-BrowserListItem -Type -1 -Name ".."))
+    }
 
     $rawParsedItems = @()
     if ($Prov -eq "GCS" -or $Prov -eq "GDRIVE") {
         if ($Prov -eq "GCS" -and ([string]::IsNullOrWhiteSpace($Buc) -or $Buc -match "Select Bucket" -or $Buc -match "--- Bucket ---" -or $Buc -match "Type Bucket")) { $Form.Cursor = [System.Windows.Forms.Cursors]::Default; return }
         $LblP.Text = if ($Prov -eq "GCS") { "Path: gs://$Buc/$Pth" } else { "Path: /$Pth" }
-        $rawParsedItems = Get-CloudItems $Prov $Buc $Pth $false
+        # Ensures $IsSrc is correctly passed downward to identify the billing project
+        $rawParsedItems = Get-CloudItems $Prov $Buc $Pth $false $IsSrc
     } elseif ($Prov -eq "LOCAL") {
         $LblP.Text = "Path: $LocP"
         if (![string]::IsNullOrWhiteSpace($LocP) -and (Test-Path -LiteralPath $LocP)) {
@@ -1163,23 +1014,25 @@ function Update-Directory([bool]$IsSrc) {
             "Date (Old)" { $parsedItems = $parsedItems | Sort-Object Type, RawDate }
             default { $parsedItems = $parsedItems | Sort-Object Type, Name }
         }
-        foreach ($pItem in $parsedItems) { [void]$Lbx.Items.Add($pItem.DisplayString) }
+        foreach ($pItem in $parsedItems) { [void]$Lbx.Items.Add($pItem) }
     }
     
     if ($IsSrc) {
         $ChkExclusions.Items.Clear()
         if ($Prov -eq "LOCAL") {
-            if (Test-Path $LocP) { 
-                $subs = Get-ChildItem $LocP -Force -ErrorAction SilentlyContinue 
-                foreach($d in $subs){ 
-                    if (-not (Is-Filtered $d.Name)) {
-                        $prefix = if ($d.PSIsContainer) { "[DIR]  " } else { "[FILE] " }
-                        [void]$ChkExclusions.Items.Add("$prefix$($d.Name)", $true) 
-                    }
-                } 
-            }
+            try {
+                if (Test-Path -LiteralPath $LocP -ErrorAction Stop) { 
+                    $subs = Get-ChildItem $LocP -Force -ErrorAction SilentlyContinue 
+                    foreach($d in $subs){ 
+                        if (-not (Is-Filtered $d.Name)) {
+                            $prefix = if ($d.PSIsContainer) { "[DIR]  " } else { "[FILE] " }
+                            [void]$ChkExclusions.Items.Add("$prefix$($d.Name)", $true) 
+                        }
+                    } 
+                }
+            } catch {}
         } else {
-            $subCloud = Get-CloudItems $Prov $Buc $Pth $false
+            $subCloud = Get-CloudItems $Prov $Buc $Pth $false $IsSrc
             foreach($d in $subCloud){ 
                 $rawName = $d.Name -replace '/$', ''
                 if (-not (Is-Filtered $rawName)) {
@@ -1289,8 +1142,8 @@ function Load-TaskToUI($taskId, [bool]$IsReadOnly) {
         $LbxSrcDir.Items.Clear()
         $LbxDstDir.Items.Clear()
         $ChkExclusions.Items.Clear()
-        [void]$LbxSrcDir.Items.Add("--- Storage not loaded (Read-Only Mode) ---")
-        [void]$LbxDstDir.Items.Add("--- Storage not loaded (Read-Only Mode) ---")
+        [void]$LbxSrcDir.Items.Add((New-BrowserListItem -Type -2 -Name "" -DisplayString "--- Storage not loaded (Read-Only Mode) ---"))
+        [void]$LbxDstDir.Items.Add((New-BrowserListItem -Type -2 -Name "" -DisplayString "--- Storage not loaded (Read-Only Mode) ---"))
         
         $BtnUpload.Enabled = $false
         $BtnDstRef.Enabled = $false
@@ -1314,8 +1167,11 @@ $Form.Add_Shown({
     Load-Tasks; Sync-TasksToUI; 
     $PThird = [math]::Floor($SplitRightOuter.Height / 2); $SplitRightOuter.SplitterDistance = $PThird; 
     $SplitBrowsers.SplitterDistance = [math]::Floor($SplitBrowsers.Width / 2)
-    # UI TWEAK: Set Source Splitter to precisely 50/50 balance by default upon startup
-    if ($Global:SplitSrc) { $Global:SplitSrc.SplitterDistance = [math]::Floor($Global:SplitSrc.Height / 2) }
+    if ($Global:SplitSrc) { 
+        $idealDist = [math]::Floor(($Global:SplitSrc.Height + 110) / 2)
+        if ($idealDist -lt 160) { $idealDist = 160 }
+        $Global:SplitSrc.SplitterDistance = $idealDist
+    }
 })
 $BtnSettings.Add_Click({ Show-SettingsDialog })
 $BtnDarkMode.Add_Click({ $Global:AppSettings.IsDarkMode = -not $Global:AppSettings.IsDarkMode; Save-Settings; Update-Theme; Sync-TasksToUI })
@@ -1414,27 +1270,182 @@ $BtnOpenLog.Add_Click({
     }
 })
 
+function Invoke-GlobalSignOut {
+    param([string]$Provider)
+
+    if ($Provider -eq "GCS") {
+        $confirm = [System.Windows.Forms.MessageBox]::Show("Sign out of Google Cloud Storage? This will wipe your credentials globally so you can switch accounts.", "Sign Out GCS", "YesNo", "Warning")
+        if ($confirm -eq "Yes") {
+            $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            $gcmd = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+            
+            try { 
+                $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $pInfo.FileName = "cmd.exe"
+                $pInfo.Arguments = "/c `"`"$gcmd`" auth revoke --all --quiet`""
+                $pInfo.UseShellExecute = $false
+                $pInfo.CreateNoWindow = $true
+                $p = [System.Diagnostics.Process]::Start($pInfo)
+                $p.WaitForExit()
+            } catch {}
+            
+            try { 
+                $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $pInfo.FileName = "cmd.exe"
+                $pInfo.Arguments = "/c `"`"$gcmd`" auth application-default revoke --quiet`""
+                $pInfo.UseShellExecute = $false
+                $pInfo.CreateNoWindow = $true
+                $p = [System.Diagnostics.Process]::Start($pInfo)
+                $p.WaitForExit()
+            } catch {}
+            
+            $adcPath = Join-Path $env:APPDATA "gcloud\application_default_credentials.json"
+            if (Test-Path -LiteralPath $adcPath) { Remove-Item -LiteralPath $adcPath -Force -ErrorAction SilentlyContinue }
+            try { Remove-Item Env:GOOGLE_APPLICATION_CREDENTIALS -ErrorAction SilentlyContinue } catch {}
+            
+            # HARD WIPE GCLOUD CACHE
+            $gcloudAppData = Join-Path $env:APPDATA "gcloud"
+            if (Test-Path -LiteralPath $gcloudAppData) {
+                try { Remove-Item -Path "$gcloudAppData\credentials.db" -Force -ErrorAction SilentlyContinue } catch {}
+                try { Remove-Item -Path "$gcloudAppData\access_tokens.db" -Force -ErrorAction SilentlyContinue } catch {}
+                try { Remove-Item -Path "$gcloudAppData\legacy_credentials" -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+            }
+            
+            $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+            [System.Windows.Forms.MessageBox]::Show("GCS credentials successfully cleared! You can now click Login/Auth to sign in with a different account.", "Signed Out") | Out-Null
+        }
+    } elseif ($Provider -eq "GDRIVE") {
+        $confirm = [System.Windows.Forms.MessageBox]::Show("Sign out of Google Drive? This will wipe your rclone auth token.", "Sign Out Google Drive", "YesNo", "Warning")
+        if ($confirm -eq "Yes") {
+            $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            try { 
+                $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $pInfo.FileName = $Global:RcloneExe
+                $pInfo.Arguments = "config delete `"$Global:RemoteName`" --config `"$Global:TempConfig`""
+                $pInfo.UseShellExecute = $false
+                $pInfo.CreateNoWindow = $true
+                $p = [System.Diagnostics.Process]::Start($pInfo)
+                $p.WaitForExit()
+            } catch {}
+            
+            # Extra hard wipe for rclone config
+            try {
+                if (Test-Path -LiteralPath $Global:TempConfig) {
+                    $rcloneConfigText = Get-Content -LiteralPath $Global:TempConfig -Raw
+                    $newConfigText = $rcloneConfigText -replace '(?ms)\[GWorkspaceAuth\].*?(?=\[|$)', ''
+                    $newConfigText | Out-File -LiteralPath $Global:TempConfig -Encoding utf8 -Force
+                }
+            } catch {}
+            
+            $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+            [System.Windows.Forms.MessageBox]::Show("Google Drive credentials successfully cleared! You can now click Login/Auth to sign in with a different account.", "Signed Out") | Out-Null
+        }
+    }
+}
+
+function Handle-SignOutClick([bool]$IsSrc) {
+    $Prov = if($IsSrc){$Global:SrcProvider}else{$Global:DstProvider}
+    if ($Prov -notmatch "GCS|GDRIVE") { return }
+
+    Invoke-GlobalSignOut -Provider $Prov
+
+    if ($IsSrc) { $Global:SrcPath = ""; $Global:SrcIsFile = $false } else { $Global:DstPath = "" }
+    Handle-ProviderChange $IsSrc
+}
+
 function Handle-AuthClick([bool]$IsSrc) {
     $Prov = if($IsSrc){$Global:SrcProvider}else{$Global:DstProvider}
     $ProvCmb = if($IsSrc){$CmbSrcProvider}else{$CmbDstProvider}
+    
     if ($Prov -eq "GCS") {
-        if ((Start-Process gcloud.cmd -ArgumentList "auth login" -Wait -PassThru).ExitCode -eq 0) { 
-            Start-Process gcloud.cmd -ArgumentList "auth application-default login" -Wait -NoNewWindow
-            $ProvCmb.SelectedIndex = 0; $ProvCmb.SelectedIndex = 1 
+        $gcmd = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+        try {
+            $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pInfo.FileName = "cmd.exe"
+            $pInfo.Arguments = "/c `"`"$gcmd`" auth login`""
+            $pInfo.UseShellExecute = $false
+            $pInfo.CreateNoWindow = $false
+            $p = [System.Diagnostics.Process]::Start($pInfo)
+            $p.WaitForExit()
+            
+            if ($p.ExitCode -eq 0) { 
+                # TEMPORARILY REMOVE ENV VAR TO PREVENT (Y/n) PROMPT IN THE BACKGROUND
+                $backupEnv = $env:GOOGLE_APPLICATION_CREDENTIALS
+                $env:GOOGLE_APPLICATION_CREDENTIALS = ""
+
+                $pInfo2 = New-Object System.Diagnostics.ProcessStartInfo
+                $pInfo2.FileName = "cmd.exe"
+                $pInfo2.Arguments = "/c `"`"$gcmd`" auth application-default login`""
+                $pInfo2.UseShellExecute = $false
+                $pInfo2.CreateNoWindow = $false
+                $p2 = [System.Diagnostics.Process]::Start($pInfo2)
+                $p2.WaitForExit()
+                
+                # Restore Env Var
+                if ($backupEnv) { $env:GOOGLE_APPLICATION_CREDENTIALS = $backupEnv }
+                Set-GCloudEnvironment
+
+                $ProvCmb.SelectedIndex = 0; $ProvCmb.SelectedIndex = 1 
+            }
+        } catch {} finally {
+            $Form.Cursor = [System.Windows.Forms.Cursors]::Default
         }
     } else {
-        $authArgs = "config create $Global:RemoteName drive scope=drive team_drive=`"`" --config `"$Global:TempConfig`""
-        if ((Start-Process $Global:RcloneExe -ArgumentList $authArgs -Wait -NoNewWindow -PassThru).ExitCode -eq 0) { $ProvCmb.SelectedIndex = 0; $ProvCmb.SelectedIndex = 2 }
+        $driveExtraArgs = ""
+        if (-not [string]::IsNullOrWhiteSpace($Global:AppSettings.DriveClientId) -and -not [string]::IsNullOrWhiteSpace($Global:AppSettings.DriveClientSecret)) {
+            $driveExtraArgs = " client_id=`"$($Global:AppSettings.DriveClientId)`" client_secret=`"$($Global:AppSettings.DriveClientSecret)`""
+        }
+        try {
+            $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+
+            # Always wipe the existing remote first so config create always runs with
+            # the currently saved credentials (built-in or custom Client ID).
+            try {
+                $pDel = New-Object System.Diagnostics.ProcessStartInfo
+                $pDel.FileName = $Global:RcloneExe
+                $pDel.Arguments = "config delete `"$Global:RemoteName`" --config `"$Global:TempConfig`""
+                $pDel.UseShellExecute = $false
+                $pDel.CreateNoWindow = $true
+                $proc = [System.Diagnostics.Process]::Start($pDel)
+                $proc.WaitForExit()
+            } catch {}
+            # Also strip any leftover section from the config file directly
+            try {
+                if (Test-Path -LiteralPath $Global:TempConfig) {
+                    $cfg = Get-Content -LiteralPath $Global:TempConfig -Raw
+                    $cfg = $cfg -replace '(?ms)\[$([regex]::Escape($Global:RemoteName))\].*?(?=\[|\z)', ''
+                    $cfg | Out-File -LiteralPath $Global:TempConfig -Encoding utf8 -Force
+                }
+            } catch {}
+
+            $authArgs = "config create `"$Global:RemoteName`" drive scope=drive team_drive=`"`"$driveExtraArgs --config `"$Global:TempConfig`""
+            $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pInfo.FileName = $Global:RcloneExe
+            $pInfo.Arguments = $authArgs
+            $pInfo.UseShellExecute = $false
+            $pInfo.CreateNoWindow = $false
+            $p = [System.Diagnostics.Process]::Start($pInfo)
+            $p.WaitForExit()
+
+            if ($p.ExitCode -eq 0) { $ProvCmb.SelectedIndex = 0; $ProvCmb.SelectedIndex = 2 }
+        } catch {} finally {
+            $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+        }
     }
 }
 $BtnSrcAuth.Add_Click({ Handle-AuthClick $true })
 $BtnDstAuth.Add_Click({ Handle-AuthClick $false })
+
+$BtnSrcSignOut.Add_Click({ Handle-SignOutClick $true })
+$BtnDstSignOut.Add_Click({ Handle-SignOutClick $false })
 
 function Handle-ProviderChange([bool]$IsSrc) {
     $ProvCmb = if($IsSrc){$CmbSrcProvider}else{$CmbDstProvider}; $ProvList = @("", "GCS", "GDRIVE", "LOCAL"); $Prov = $ProvList[$ProvCmb.SelectedIndex]
     if($IsSrc){$Global:SrcProvider=$Prov; $Global:SrcPath=""; $Global:SrcIsFile=$false}else{$Global:DstProvider=$Prov; $Global:DstPath=""}
     
     $BtnAuth = if($IsSrc){$BtnSrcAuth}else{$BtnDstAuth}; $LblStat = if($IsSrc){$LblSrcAuthStatus}else{$LblDstAuthStatus}
+    $BtnSignOut = if($IsSrc){$BtnSrcSignOut}else{$BtnDstSignOut}
     $CmbProj = if($IsSrc){$CmbSrcProjList}else{$CmbDstProjList}; $CmbBuc = if($IsSrc){$CmbSrcBucList}else{$CmbDstBucList}
     $BtnLoc = if($IsSrc){$BtnSrcLoc}else{$BtnDstLoc}; $Lbx = if($IsSrc){$LbxSrcDir}else{$LbxDstDir}
     
@@ -1443,6 +1454,9 @@ function Handle-ProviderChange([bool]$IsSrc) {
     
     $CmbBuc.Visible=($Prov -eq "GCS") 
     $BtnLoc.Visible=($Prov -eq "LOCAL")
+    
+    $BtnSignOut.Visible = ($Prov -match "GCS|GDRIVE")
+    $BtnSignOut.Enabled = $false
     
     if ($IsSrc) { 
         $BtnSrcFilter.Visible = ($Prov -eq "LOCAL") 
@@ -1460,8 +1474,8 @@ function Handle-ProviderChange([bool]$IsSrc) {
     } 
 
     if ($Global:LoadingHistory) {
-        if ($Prov -eq "GCS") { $LblStat.Text = "Auth (GCS)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" } }
-        elseif ($Prov -eq "GDRIVE") { $LblStat.Text = "Auth (GDrive)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" } }
+        if ($Prov -eq "GCS") { $LblStat.Text = "Auth (GCS)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }; $BtnSignOut.Enabled = $true; $BtnAuth.Enabled = $false }
+        elseif ($Prov -eq "GDRIVE") { $LblStat.Text = Get-DriveAuthLabel; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }; $BtnSignOut.Enabled = $true; $BtnAuth.Enabled = $false }
         elseif ($Prov -eq "LOCAL") { $LblStat.Text = "Local Active"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" } }
         $Lbx.Enabled = $true
         return
@@ -1473,29 +1487,42 @@ function Handle-ProviderChange([bool]$IsSrc) {
         if (-not $IsSrc -and -not $Global:LoadingHistory) { $BtnDstNewF.Enabled = $true; $BtnDstRef.Enabled = $true } 
         if (($IsSrc -and $Global:SrcLocalPath) -or (!$IsSrc -and $Global:DstLocalPath)) { Update-Directory $IsSrc }
     } else {
-        $BtnAuth.Enabled = $false; $LblStat.Text = "Checking..."; $LblStat.ForeColor = "Orange"
+        $BtnAuth.Enabled = $false; $LblStat.Text = "Checking..."; $LblStat.ForeColor = "Orange"; [System.Windows.Forms.Application]::DoEvents()
         if ($Prov -eq "GCS") {
-            $data = Execute-Cli-Json -cmdArgs "gcloud.cmd projects list --format='json'"
+            try { $data = Execute-Cli-Json -cmdArgs "projects list --format=json" -isRclone $false } catch { $data = $null }
             
             if ($data) { 
                 $LblStat.Text = "Auth (GCS)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }
+                $BtnSignOut.Enabled = $true
+                $BtnAuth.Enabled = $false
                 $CmbProj.Items.Clear(); [void]$CmbProj.Items.Add("--- Project ---"); [void]$CmbProj.Items.Add("[ No Project ID (Manual) ]")
-                $data | Select-Object -ExpandProperty projectId -ErrorAction SilentlyContinue | ForEach-Object { [void]$CmbProj.Items.Add($_) }
+                
+                $dArray = if ($data -is [array]) { $data } else { @($data) }
+                $dArray | Select-Object -ExpandProperty projectId -ErrorAction SilentlyContinue | ForEach-Object { [void]$CmbProj.Items.Add($_) }
+                
                 $CmbProj.Enabled = $true; $CmbProj.SelectedIndex = 0 
                 if (-not $IsSrc -and -not $Global:LoadingHistory) { $BtnDstRef.Enabled = $true } 
             } else { 
-                $LblStat.Text = "Auth (Manual)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }
+                $LblStat.Text = "Not Connected"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightCoral" } else { "Red" }
+                $BtnSignOut.Enabled = $false
+                $BtnAuth.Enabled = $true
                 $CmbProj.Items.Clear(); [void]$CmbProj.Items.Add("[ No Project ID (Manual) ]")
                 $CmbProj.Enabled = $true; $CmbProj.SelectedIndex = 0 
             }
         } elseif ($Prov -eq "GDRIVE") {
-            $d = Execute-Cli-Json -cmdArgs "about `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --json" -isRclone $true
+            try { $d = Execute-Cli-Json -cmdArgs "about `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --json" -isRclone $true } catch { $d = $null }
             if ($d) { 
-                $LblStat.Text = "Auth (GDrive)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }; 
+                $LblStat.Text = Get-DriveAuthLabel; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }; 
+                $BtnSignOut.Enabled = $true
+                $BtnAuth.Enabled = $false
                 $Lbx.Enabled = $true; 
                 if (-not $IsSrc -and -not $Global:LoadingHistory) { $BtnDstNewF.Enabled = $true; $BtnDstRef.Enabled = $true } 
                 Update-Directory $IsSrc 
-            } else { $LblStat.Text = "Not Connected"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightCoral" } else { "Red" }; $BtnAuth.Enabled = $true }
+            } else { 
+                $LblStat.Text = "Not Connected"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightCoral" } else { "Red" }; 
+                $BtnAuth.Enabled = $true
+                $BtnSignOut.Enabled = $false
+            }
         }
     }
 }
@@ -1516,9 +1543,37 @@ function Handle-ProjChange([bool]$IsSrc) {
             $CmbBuc.Visible = $true
         } elseif ($CmbProj.SelectedIndex -gt 0) {
             $CmbBuc.DropDownStyle = "DropDownList"
-            $buckets = Execute-Cli-Json -cmdArgs "gcloud.cmd storage buckets list --project=`"$($CmbProj.SelectedItem)`" --format='json'"
+            
+            $projArg = Get-GcsProjectArg $CmbProj.SelectedItem
+            
+            try { $buckets = Execute-Cli-Json -cmdArgs (("storage buckets list {0} --format=json" -f $projArg).Trim()) -isRclone $false } catch { $buckets = $null }
             $CmbBuc.Items.Clear(); [void]$CmbBuc.Items.Add("--- Bucket ---")
-            $buckets | Select-Object -ExpandProperty name -ErrorAction SilentlyContinue | ForEach-Object{ [void]$CmbBuc.Items.Add($_) }
+            if ($buckets) { 
+                $bArray = if ($buckets -is [array]) { $buckets } else { @($buckets) }
+                $bArray | Select-Object -ExpandProperty name -ErrorAction SilentlyContinue | ForEach-Object{ [void]$CmbBuc.Items.Add($_) } 
+            } else {
+                $bucketText = Execute-Cli-Text -cmdArgs (("storage buckets list {0}" -f $projArg).Trim()) -isRclone $false
+                if (-not [string]::IsNullOrWhiteSpace($bucketText)) {
+                    foreach ($line in ($bucketText -split "`r?`n")) {
+                        $bucketName = $line.Trim() -replace '^gs://', '' -replace '/$', ''
+                        if (-not [string]::IsNullOrWhiteSpace($bucketName) -and $bucketName -notmatch '^NAME\s*$') {
+                            [void]$CmbBuc.Items.Add($bucketName)
+                        }
+                    }
+                }
+
+                if ($CmbBuc.Items.Count -le 1) {
+                    $gsBuckets = Execute-Gsutil-Result -cmdArgs "ls"
+                    if (-not [string]::IsNullOrWhiteSpace($gsBuckets.Output)) {
+                        foreach ($line in ($gsBuckets.Output -split "`r?`n")) {
+                            $bucketName = $line.Trim() -replace '^gs://', '' -replace '/$', ''
+                            if (-not [string]::IsNullOrWhiteSpace($bucketName) -and -not $CmbBuc.Items.Contains($bucketName)) {
+                                [void]$CmbBuc.Items.Add($bucketName)
+                            }
+                        }
+                    }
+                }
+            }
             $CmbBuc.Enabled = $true; $CmbBuc.SelectedIndex = 0
             $CmbBuc.Visible = $true
         }
@@ -1526,9 +1581,19 @@ function Handle-ProjChange([bool]$IsSrc) {
         $CmbBuc.DropDownStyle = "DropDownList"
         if($IsSrc){$Global:SrcPath=""}else{$Global:DstPath=""}
         if($CmbProj.SelectedItem -eq "Shared Drive"){
-            $d = Execute-Cli-Json -cmdArgs "backend drives `"${Global:RemoteName}:`" --config `"$Global:TempConfig`"" -isRclone $true; $CmbBuc.Items.Clear()
-            if ($d) { foreach($i in $d){ [void]$CmbBuc.Items.Add($i.name); $Global:DriveMap[$i.name]=$i.id }; $CmbBuc.Enabled = $true; $CmbBuc.Visible = $true; if($CmbBuc.Items.Count -gt 0){ $CmbBuc.SelectedIndex = 0 } }
-        } else { $CmbBuc.Enabled = $false; $CmbBuc.Visible = $false; Update-Directory $IsSrc }
+            try { $d = Execute-Cli-Json -cmdArgs "backend drives `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --json" -isRclone $true } catch { $d = $null }
+            $CmbBuc.Items.Clear()
+            if ($d) { 
+                $dArray = if ($d -is [array]) { $d } else { @($d) }
+                foreach($i in $dArray){ [void]$CmbBuc.Items.Add($i.name); $Global:DriveMap[$i.name]=$i.id }; $CmbBuc.Enabled = $true; $CmbBuc.Visible = $true; if($CmbBuc.Items.Count -gt 0){ $CmbBuc.SelectedIndex = 0 } 
+            }
+        } else { 
+            $CmbBuc.Items.Clear()
+            $CmbBuc.Text = ""
+            $CmbBuc.Enabled = $false
+            $CmbBuc.Visible = $false
+            Update-Directory $IsSrc 
+        }
     }
 }
 $CmbSrcProjList.Add_SelectedIndexChanged({ Handle-ProjChange $true }); $CmbDstProjList.Add_SelectedIndexChanged({ Handle-ProjChange $false })
@@ -1549,7 +1614,14 @@ function Handle-LbxDClick([bool]$IsSrc) {
     $LocP = if($IsSrc){$Global:SrcLocalPath}else{$Global:DstLocalPath}
     $CPath = if($IsSrc){$Global:SrcPath}else{$Global:DstPath}
 
-    if ($sel -match "^\.\.\s\[Go\sUp\]") {
+    $selType = $null
+    $selName = $null
+    if ($sel.PSObject -and $sel.PSObject.Properties["Type"] -and $sel.PSObject.Properties["Name"]) {
+        $selType = [int]$sel.Type
+        $selName = [string]$sel.Name
+    }
+
+    if ($selType -eq -1 -or $sel -match "^\.\.\s\[Go\sUp\]") {
         if ($Prov -eq "LOCAL") { 
             $parent = Split-Path $LocP
             if (-not [string]::IsNullOrEmpty($parent)) { $LocP = $parent } 
@@ -1558,6 +1630,10 @@ function Handle-LbxDClick([bool]$IsSrc) {
             $CPath = if ($parts.Count -le 1) {""} else {($parts[0..($parts.Count-2)] -join '/') + "/"} 
         }
         if ($IsSrc -and $Global:SrcIsFile) { $Global:SrcIsFile = $false }
+    } elseif ($selType -eq 0) {
+        if ($Prov -eq "LOCAL") { $LocP = Join-Path $LocP $selName.TrimEnd('/') } else { $CPath += $selName }
+    } elseif ($selType -eq 1) {
+        if ($IsSrc) { $Global:SrcIsFile = $true; if ($Prov -eq "LOCAL") { $LocP = Join-Path $LocP $selName } else { $CPath += $selName } } else { return }
     } elseif ($sel -match '^\[DIR\]\s+(.*?)\s+\|') { 
         if ($Prov -eq "LOCAL") { $LocP = Join-Path $LocP $Matches[1].Trim().TrimEnd('/') } else { $CPath += $Matches[1].Trim() }
     } elseif ($sel -match '^\[FILE\]\s+(.*?)\s+\|') {
@@ -1575,14 +1651,25 @@ $BtnDstLoc.Add_Click({ $diag = New-Object System.Windows.Forms.FolderBrowserDial
 $BtnDstNewF.Add_Click({
     $fName = [Microsoft.VisualBasic.Interaction]::InputBox("Enter new folder name:", "Create Folder", ""); if ([string]::IsNullOrWhiteSpace($fName)) { return }; $fName = $fName.Trim('/') 
     $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    if ($Global:DstProvider -eq "LOCAL" -and $Global:DstLocalPath) { New-Item -ItemType Directory -Path (Join-Path $Global:DstLocalPath $fName) | Out-Null }
+    if ($Global:DstProvider -eq "LOCAL" -and $Global:DstLocalPath) { try { New-Item -ItemType Directory -Path (Join-Path $Global:DstLocalPath $fName) -ErrorAction Stop | Out-Null } catch {} }
     elseif ($Global:DstProvider -eq "GCS") {
-        $tempPh = Join-Path $Global:AppDir ".placeholder"; if (-not (Test-Path $tempPh)) { $null | Out-File -FilePath $tempPh -Encoding utf8 }
+        $tempPh = Join-Path $Global:AppDir ".placeholder"; if (-not (Test-Path $tempPh)) { try { $null | Out-File -FilePath $tempPh -Encoding utf8 -ErrorAction Stop } catch {} }
         $destUri = if ($Global:DstPath) { "gs://$($CmbDstBucList.Text)/$($Global:DstPath.Trim('/'))/$fName/.placeholder" } else { "gs://$($CmbDstBucList.Text)/$fName/.placeholder" }
-        [System.Diagnostics.Process]::Start((New-Object System.Diagnostics.ProcessStartInfo -Property @{FileName="gcloud.cmd"; Arguments="storage cp `"$tempPh`" `"$destUri`""; WorkingDirectory=$Global:GCloudBin; WindowStyle="Hidden"; CreateNoWindow=$true})).WaitForExit()
+        $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+        
+        $projArg = ""
+        if (-not [string]::IsNullOrWhiteSpace($CmbDstProjList.SelectedItem) -and $CmbDstProjList.SelectedItem -notmatch "No Project") {
+            $projArg = " --project=`"$($CmbDstProjList.SelectedItem)`""
+        }
+        
+        try { [System.Diagnostics.Process]::Start((New-Object System.Diagnostics.ProcessStartInfo -Property @{FileName="cmd.exe"; Arguments="/c `"`"$gcloudToolPath`" storage cp `"$tempPh`" `"$destUri`"$projArg`""; WindowStyle="Hidden"; CreateNoWindow=$true})).WaitForExit() } catch {}
     } elseif ($Global:DstProvider -eq "GDRIVE") {
-        $args = "mkdir `"${Global:RemoteName}:${Global:DstPath}$fName`" --config `"$Global:TempConfig`""; if ($CmbDstProjList.SelectedItem -eq "Shared Drive") { $args += " --drive-team-drive=$($Global:DriveMap[$CmbDstBucList.Text])" }
-        [System.Diagnostics.Process]::Start((New-Object System.Diagnostics.ProcessStartInfo -Property @{FileName=$Global:RcloneExe; Arguments=$args; WindowStyle="Hidden"; CreateNoWindow=$true})).WaitForExit()
+        $target = "${Global:RemoteName}:${Global:DstPath}$fName"
+        if ($CmbDstProjList.SelectedItem -eq "Shared Drive" -and $Global:DriveMap.ContainsKey($CmbDstBucList.Text)) {
+            $target = "${Global:RemoteName},team_drive=$($Global:DriveMap[$CmbDstBucList.Text]):${Global:DstPath}$fName"
+        }
+        $args = "mkdir `"$target`" --config `"$Global:TempConfig`""
+        try { [System.Diagnostics.Process]::Start((New-Object System.Diagnostics.ProcessStartInfo -Property @{FileName=$Global:RcloneExe; Arguments=$args; WindowStyle="Hidden"; CreateNoWindow=$true})).WaitForExit() } catch {}
     }
     $Form.Cursor = [System.Windows.Forms.Cursors]::Default; Update-Directory $false
 })
@@ -1590,11 +1677,18 @@ $BtnDstNewF.Add_Click({
 # --- 5. ENGINE REWRITE (UNIFIED TARGETED ITERATION) ---
 
 $BtnUpload.Add_Click({
-    if ($Global:SrcProvider -eq "LOCAL" -and !$Global:SrcLocalPath) { Log-Message "Source Local path not selected." "LightCoral"; return }
-    if ($Global:DstProvider -eq "LOCAL" -and !$Global:DstLocalPath) { Log-Message "Target Local path not selected." "LightCoral"; return }
+    if ($Global:SrcProvider -eq "LOCAL" -and -not $Global:SrcLocalPath) { Log-Message "Source Local path not selected." "LightCoral"; return }
+    if ($Global:DstProvider -eq "LOCAL" -and -not $Global:DstLocalPath) { Log-Message "Target Local path not selected." "LightCoral"; return }
     
-    if ($Global:SrcProvider -eq "GCS" -and ([string]::IsNullOrWhiteSpace($CmbSrcBucList.Text) -or $CmbSrcBucList.Text -match "--- Bucket ---" -or $CmbSrcBucList.Text -match "Type Bucket")) { Log-Message "Source Bucket not selected." "LightCoral"; return }
-    if ($Global:DstProvider -eq "GCS" -and ([string]::IsNullOrWhiteSpace($CmbDstBucList.Text) -or $CmbDstBucList.Text -match "--- Bucket ---" -or $CmbDstBucList.Text -match "Type Bucket")) { Log-Message "Target Bucket not selected." "LightCoral"; return }
+    if ($Global:SrcProvider -eq "GCS") {
+        $sBuc = $CmbSrcBucList.Text
+        if ([string]::IsNullOrWhiteSpace($sBuc) -or $sBuc -match "--- Bucket ---" -or $sBuc -match "Type Bucket") { Log-Message "Source Bucket not selected." "LightCoral"; return }
+    }
+    
+    if ($Global:DstProvider -eq "GCS") {
+        $dBuc = $CmbDstBucList.Text
+        if ([string]::IsNullOrWhiteSpace($dBuc) -or $dBuc -match "--- Bucket ---" -or $dBuc -match "Type Bucket") { Log-Message "Target Bucket not selected." "LightCoral"; return }
+    }
 
     if ([string]::IsNullOrWhiteSpace($TxtTaskName.Text)) { $TxtTaskName.Text = "Transfer $(Get-Date -Format 'MM-dd HH:mm')" }
     
@@ -1650,9 +1744,19 @@ $BtnUpload.Add_Click({
     $BtnSrcLoc.Enabled = $false; $BtnSrcFilter.Enabled = $false; $BtnDstLoc.Enabled = $false; $BtnDstNewF.Enabled = $false; $BtnDstRef.Enabled = $false
     $BtnUpload.Enabled = $false; $BtnCheckAll.Enabled = $false; $BtnUncheckAll.Enabled = $false
     
-    $RtbLog.Enabled = $true; $BtnStop.Enabled = $true; $Global:StopTransfer = $false; $RtbLog.Clear()
+    $RtbLog.Enabled = $true; $BtnStop.Enabled = $true; $Global:StopTransfer = $false
+    
+    if (-not $existing -or [string]::IsNullOrWhiteSpace($RtbLog.Text)) {
+        $RtbLog.Clear()
+    } else {
+        Log-Message "`n=========================================================" "Yellow"
+        $runType = if ($existing.Status -eq "Completed") { "RESTARTING" } else { "RESUMING" }
+        Log-Message "  $runType TRANSFER TASK: $(Get-Date -Format 'MM/dd/yyyy HH:mm:ss')" "Yellow"
+        Log-Message "=========================================================" "Yellow"
+    }
 
-    $ReportLog = New-Object System.Collections.ArrayList; [void]$ReportLog.Add("--- TRANSFER STARTED ---"); Log-Message "--- TRANSFER STARTED ---" "Cyan"
+    Log-Message "--- TRANSFER STARTED ---" "Cyan"
+    [System.Windows.Forms.Application]::DoEvents() 
 
     $UseGCloud = (($Global:SrcProvider -eq "LOCAL" -and $Global:DstProvider -eq "GCS") -or 
                   ($Global:SrcProvider -eq "GCS" -and $Global:DstProvider -eq "LOCAL") -or 
@@ -1660,26 +1764,63 @@ $BtnUpload.Add_Click({
 
     if (($Global:SrcProvider -eq "GCS" -or $Global:DstProvider -eq "GCS") -and -not $UseGCloud) {
         $adcPath = Join-Path $env:APPDATA "gcloud\application_default_credentials.json"
-        if (-not (Test-Path $adcPath)) {
-            Log-Message "Missing Application Default Credentials for cross-Cloud connection. Requesting..." "Yellow"
-            
-            $p = Start-Process gcloud.cmd -ArgumentList "auth application-default login" -Wait -PassThru
-            if ($p.ExitCode -ne 0 -or -not (Test-Path $adcPath)) {
-                Log-Message "Failed to acquire ADC credentials. Rclone requires this to bridge to GCS. Transfer aborted." "LightCoral"
-                $Global:StopTransfer = $true
+        try {
+            if (-not (Test-Path $adcPath -ErrorAction Stop)) {
+                Log-Message "Missing Application Default Credentials for cross-Cloud connection. Requesting..." "Yellow"
+                $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+                try {
+                    $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+                    $pInfo.FileName = "cmd.exe"
+                    $pInfo.Arguments = "/c `"`"$gcloudToolPath`" auth application-default login`""
+                    $pInfo.UseShellExecute = $false
+                    $pInfo.CreateNoWindow = $false
+                    $p = [System.Diagnostics.Process]::Start($pInfo)
+                    $p.WaitForExit()
+                    
+                    if ($p.ExitCode -ne 0 -or -not (Test-Path $adcPath -ErrorAction Stop)) {
+                        Log-Message "Failed to acquire ADC credentials. Rclone requires this to bridge to GCS. Transfer aborted." "LightCoral"
+                        $Global:StopTransfer = $true
+                    }
+                } catch {
+                    Log-Message "Failed to launch gcloud to acquire ADC credentials. Transfer aborted." "LightCoral"
+                    $Global:StopTransfer = $true
+                }
             }
-        }
-        if (Test-Path $adcPath) { $env:GOOGLE_APPLICATION_CREDENTIALS = $adcPath }
+            if (Test-Path $adcPath -ErrorAction Stop) { $env:GOOGLE_APPLICATION_CREDENTIALS = $adcPath }
+        } catch {}
     }
 
     if ($Global:StopTransfer -eq $false) {
+
+        # --- AUTO-CLEANUP FIX: Prevent GCS 404 tracking errors ---
+        try {
+            $trackerBases = @(
+                (Join-Path $env:APPDATA "gcloud\storage"),
+                (Join-Path $env:APPDATA "gcloud\surface_data\storage"),
+                (Join-Path $env:USERPROFILE ".gsutil")
+            )
+            $targetFolders = @("tracker-files", "tracker_files", "rsync", "parallel_composite_uploads")
+            
+            foreach ($base in $trackerBases) {
+                if (Test-Path -LiteralPath $base) {
+                    foreach ($folder in $targetFolders) {
+                        $targetDir = Join-Path $base $folder
+                        if (Test-Path -LiteralPath $targetDir) {
+                            Remove-Item -LiteralPath $targetDir -Recurse -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+            }
+        } catch {}
+        # ---------------------------------------------------------
         
         $singleCheckedItem = ""
         if ($selCount -eq 1 -and $totCount -gt 0) {
             $singleCheckedItem = $incItems[0].Name
         }
         
-        $srcName = if ($Global:SrcIsFile) { Split-Path $Global:SrcLocalPath -Leaf } elseif ($singleCheckedItem -ne "") { $singleCheckedItem } elseif ($selCount -gt 1) { "Multiple Items ($selCount)" } elseif ($Global:SrcPath) { ($Global:SrcPath.TrimEnd('/') -split '/')[-1] } else { "Root Directory" }
+        $srcFileLeaf = Get-SourceLeafName
+        $srcName = if ($Global:SrcIsFile) { $srcFileLeaf } elseif ($singleCheckedItem -ne "") { $singleCheckedItem } elseif ($selCount -gt 1) { "Multiple Items ($selCount)" } elseif ($Global:SrcPath) { ($Global:SrcPath.TrimEnd('/') -split '/')[-1] } else { "Root Directory" }
         $displayName = if ($srcName.Length -gt 25) { $srcName.Substring(0, 22) + "..." } else { $srcName }
         
         $transferStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1688,11 +1829,21 @@ $BtnUpload.Add_Click({
         $PrgTotal.Maximum = 100; $PrgTotal.Value = 0; $PrgTotal.Style = "Marquee"
 
         $Global:RunLogFile = [System.IO.Path]::GetFullPath((Join-Path $env:TEMP "transfer_run_$([guid]::NewGuid().ToString('N')).log"))
-        if (Test-Path -LiteralPath $Global:RunLogFile) { Remove-Item -LiteralPath $Global:RunLogFile -Force -ErrorAction SilentlyContinue }
-        $null | Out-File -LiteralPath $Global:RunLogFile -Encoding utf8
+        try { if (Test-Path -LiteralPath $Global:RunLogFile -ErrorAction Stop) { Remove-Item -LiteralPath $Global:RunLogFile -Force -ErrorAction Stop } } catch {}
+        try { $null | Out-File -LiteralPath $Global:RunLogFile -Encoding utf8 -ErrorAction Stop } catch {}
+        $Global:FullLogLines = New-Object System.Collections.ArrayList
+        $lastTransferSpeed = ""
 
-        $rSrcBase = if($Global:SrcProvider -eq "LOCAL"){$Global:SrcLocalPath}elseif($Global:SrcProvider -eq "GCS"){"${Global:GcsBridgeName}:$($CmbSrcBucList.Text)/$Global:SrcPath"}else{"${Global:RemoteName}:${Global:SrcPath}"}
-        $rDstBase = if($Global:DstProvider -eq "LOCAL"){$Global:DstLocalPath}elseif($Global:DstProvider -eq "GCS"){"${Global:GcsBridgeName}:$($CmbDstBucList.Text)/$Global:DstPath"}else{"${Global:RemoteName}:${Global:DstPath}"}
+        if ($Global:SrcProvider -eq "LOCAL") { $rSrcBase = $Global:SrcLocalPath }
+        elseif ($Global:SrcProvider -eq "GCS") { $rSrcBase = "${Global:GcsBridgeName}:$($CmbSrcBucList.Text)/$Global:SrcPath" }
+        elseif ($Global:SrcProvider -eq "GDRIVE" -and $CmbSrcProjList.SelectedItem -eq "Shared Drive" -and $Global:DriveMap.ContainsKey($CmbSrcBucList.Text)) { $rSrcBase = "${Global:RemoteName},team_drive=$($Global:DriveMap[$CmbSrcBucList.Text]):$Global:SrcPath" }
+        else { $rSrcBase = "${Global:RemoteName}:${Global:SrcPath}" }
+
+        if ($Global:DstProvider -eq "LOCAL") { $rDstBase = $Global:DstLocalPath }
+        elseif ($Global:DstProvider -eq "GCS") { $rDstBase = "${Global:GcsBridgeName}:$($CmbDstBucList.Text)/$Global:DstPath" }
+        elseif ($Global:DstProvider -eq "GDRIVE" -and $CmbDstProjList.SelectedItem -eq "Shared Drive" -and $Global:DriveMap.ContainsKey($CmbDstBucList.Text)) { $rDstBase = "${Global:RemoteName},team_drive=$($Global:DriveMap[$CmbDstBucList.Text]):$Global:DstPath" }
+        else { $rDstBase = "${Global:RemoteName}:${Global:DstPath}" }
+        
         $rSrcBase = $rSrcBase -replace '(?<!:)/{2,}', '/'
         $rDstBase = $rDstBase -replace '(?<!:)/{2,}', '/'
 
@@ -1701,15 +1852,85 @@ $BtnUpload.Add_Click({
         $gSrcBase = $gSrcBase -replace '(?<!gs:)/{2,}', '/'
         $gDstBase = $gDstBase -replace '(?<!gs:)/{2,}', '/'
 
-        $Global:TotalTransferItems = -1
-        $LblFolderCount.Text = "Item(s): Waiting for tool output..."
-        $LblProgress.Text = "Progress ($displayName): Starting..."
+        $Global:TotalTransferItems = 0
+        $LblFolderCount.Text = "Item(s): Calculating transfer size..."
+        $LblProgress.Text = "Progress ($displayName): Calculating..."
+        if ($Global:AppSettings.IsDebugMode) { Log-Message "DEBUG: Starting targeted pre-flight file count..." "Yellow" }
+        [System.Windows.Forms.Application]::DoEvents()
+        
+        if ($Global:SrcProvider -eq "LOCAL" -and (Test-Path -LiteralPath $gSrcBase)) {
+            try {
+                if ($incItems.Count -gt 0 -and $totCount -gt 0) {
+                    foreach ($incObj in $incItems) {
+                        $tPath = Join-Path $gSrcBase $incObj.Name
+                        if ($Global:AppSettings.IsDebugMode) { Log-Message "DEBUG: Scanning inclusion path: $tPath" "DarkGray" }
+                        if (-not $incObj.IsDir -and (Test-Path -LiteralPath $tPath -PathType Leaf)) { 
+                            $Global:TotalTransferItems++ 
+                        } elseif ($incObj.IsDir -and (Test-Path -LiteralPath $tPath -PathType Container)) {
+                            $Global:TotalTransferItems += @(Get-ChildItem -LiteralPath $tPath -File -Recurse -Force -ErrorAction SilentlyContinue).Count
+                        }
+                        [System.Windows.Forms.Application]::DoEvents()
+                    }
+                } else {
+                    if ($Global:AppSettings.IsDebugMode) { Log-Message "DEBUG: Scanning root directory: $gSrcBase" "DarkGray" }
+                    if (Test-Path -LiteralPath $gSrcBase -PathType Leaf) { $Global:TotalTransferItems = 1 }
+                    else { $Global:TotalTransferItems += @(Get-ChildItem -LiteralPath $gSrcBase -File -Recurse -Force -ErrorAction SilentlyContinue).Count }
+                }
+            } catch { $Global:TotalTransferItems = -1 }
+        } elseif ($Global:SrcProvider -eq "GCS") {
+            try {
+                $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+                
+                $projArg = ""
+                if (-not [string]::IsNullOrWhiteSpace($CmbSrcProjList.SelectedItem) -and $CmbSrcProjList.SelectedItem -notmatch "No Project") {
+                    $projArg = "--project=`"$($CmbSrcProjList.SelectedItem)`" "
+                }
+                
+                if ($incItems.Count -gt 0 -and $totCount -gt 0) {
+                    foreach ($incObj in $incItems) {
+                        $sTarget = "$gSrcBase/$($incObj.Name)" -replace '(?<!gs:)/{2,}', '/'
+                        if ($incObj.IsDir) { $lsArgs = "storage ls `"$sTarget/**`" $projArg" } else { $lsArgs = "storage ls `"$sTarget`" $projArg" }
+                        if ($Global:AppSettings.IsDebugMode) { Log-Message "DEBUG: Scanning cloud path via: $lsArgs" "DarkGray" }
+                        
+                        $pInfoLs = New-Object System.Diagnostics.ProcessStartInfo
+                        $pInfoLs.FileName = "cmd.exe"
+                        $pInfoLs.Arguments = "/c `"call `"$gcloudToolPath`" $lsArgs`""
+                        $pInfoLs.RedirectStandardOutput = $true
+                        $pInfoLs.UseShellExecute = $false
+                        $pInfoLs.CreateNoWindow = $true
+                        $pLs = [System.Diagnostics.Process]::Start($pInfoLs)
+                        $lsOut = $pLs.StandardOutput.ReadToEnd()
+                        $pLs.WaitForExit()
+                        $Global:TotalTransferItems += ($lsOut -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -match "^gs://" -and $_ -notmatch "/$" }).Count
+                        [System.Windows.Forms.Application]::DoEvents()
+                    }
+                } else {
+                    $sTarget = if ($gSrcBase.EndsWith('/')) { $gSrcBase } else { $gSrcBase + '/' }
+                    $lsArgs = "storage ls `"$sTarget**`" $projArg"
+                    if ($Global:AppSettings.IsDebugMode) { Log-Message "DEBUG: Scanning cloud root via: $lsArgs" "DarkGray" }
+                    
+                    $pInfoLs = New-Object System.Diagnostics.ProcessStartInfo
+                    $pInfoLs.FileName = "cmd.exe"
+                    $pInfoLs.Arguments = "/c `"call `"$gcloudToolPath`" $lsArgs`""
+                    $pInfoLs.RedirectStandardOutput = $true
+                    $pInfoLs.UseShellExecute = $false
+                    $pInfoLs.CreateNoWindow = $true
+                    $pLs = [System.Diagnostics.Process]::Start($pInfoLs)
+                    $lsOut = $pLs.StandardOutput.ReadToEnd()
+                    $pLs.WaitForExit()
+                    $Global:TotalTransferItems += ($lsOut -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -match "^gs://" -and $_ -notmatch "/$" }).Count
+                }
+            } catch { $Global:TotalTransferItems = -1 }
+        } else {
+            $Global:TotalTransferItems = -1 
+        }
 
-        $transferCommands = New-Object 'System.Collections.Generic.List[TransferCommand]'
-        $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
-        $gcloudEnvironment = @{}
-        if ($env:CLOUDSDK_PYTHON) { $gcloudEnvironment["CLOUDSDK_PYTHON"] = $env:CLOUDSDK_PYTHON }
+        if ($Global:AppSettings.IsDebugMode) { Log-Message "DEBUG: Pre-flight count complete. Found $($Global:TotalTransferItems) items." "Yellow" }
+        [System.Windows.Forms.Application]::DoEvents()
 
+        $Global:BatFile = Join-Path $env:TEMP "run_transfer_$taskId.bat"
+        $batContent = "@echo off`nchcp 65001 >nul`n"
+        
         $Global:ExcludeFile = ""
         if (-not $UseGCloud) {
             $excludeLines = New-Object System.Collections.ArrayList
@@ -1731,7 +1952,7 @@ $BtnUpload.Add_Click({
 
             if ($excludeLines.Count -gt 0) {
                 $Global:ExcludeFile = [System.IO.Path]::GetFullPath((Join-Path $env:TEMP "excludes_$([guid]::NewGuid().ToString('N')).txt"))
-                [System.IO.File]::WriteAllLines($Global:ExcludeFile, $excludeLines.ToArray(), (New-Object System.Text.UTF8Encoding $false))
+                try { [System.IO.File]::WriteAllLines($Global:ExcludeFile, $excludeLines.ToArray(), (New-Object System.Text.UTF8Encoding $false)) } catch {}
             }
         }
 
@@ -1746,20 +1967,25 @@ $BtnUpload.Add_Click({
                     $srcTargetSafe = if ($Global:SrcProvider -eq "LOCAL" -and $srcTarget.EndsWith('\')) { $srcTarget + '\' } else { $srcTarget }
                     $dstTargetSafe = if ($Global:DstProvider -eq "LOCAL" -and $dstTarget.EndsWith('\')) { $dstTarget + '\' } else { $dstTarget }
                     
+                    $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+                    $gCmdBase = "call `"$gcloudToolPath`""
+                    
                     if ($incObj.IsDir) {
-                        if ($Global:SrcProvider -eq "LOCAL" -and (Test-Path -LiteralPath $srcTargetSafe)) {
+                        if ($Global:SrcProvider -eq "LOCAL") {
                             try {
-                                $allDirs = Get-ChildItem -LiteralPath $srcTargetSafe -Recurse -Directory -Force -ErrorAction SilentlyContinue
-                                foreach ($dir in $allDirs) {
-                                    $items = Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue
-                                    if ($null -eq $items -or $items.Count -eq 0) { $null | Out-File -FilePath (Join-Path $dir.FullName ".placeholder") -Encoding utf8 }
+                                if (Test-Path -LiteralPath $srcTargetSafe -ErrorAction Stop) {
+                                    $allDirs = Get-ChildItem -LiteralPath $srcTargetSafe -Recurse -Directory -Force -ErrorAction SilentlyContinue
+                                    foreach ($dir in $allDirs) {
+                                        $items = Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue
+                                        if ($null -eq $items -or $items.Count -eq 0) { $null | Out-File -FilePath (Join-Path $dir.FullName ".placeholder") -Encoding utf8 }
+                                    }
+                                    $rootItems = Get-ChildItem -LiteralPath $srcTargetSafe -Force -ErrorAction SilentlyContinue
+                                    if ($null -eq $rootItems -or $rootItems.Count -eq 0) { $null | Out-File -FilePath (Join-Path $srcTargetSafe ".placeholder") -Encoding utf8 }
                                 }
-                                $rootItems = Get-ChildItem -LiteralPath $srcTargetSafe -Force -ErrorAction SilentlyContinue
-                                if ($null -eq $rootItems -or $rootItems.Count -eq 0) { $null | Out-File -FilePath (Join-Path $srcTargetSafe ".placeholder") -Encoding utf8 }
                             } catch {}
                         }
                         
-                        $gArgs = @("storage", "rsync", $srcTargetSafe, $dstTargetSafe, "--recursive")
+                        $gArgs = "storage rsync `"$srcTargetSafe`" `"$dstTargetSafe`" --recursive"
                         
                         $gcloudExcludes = @()
                         if ($Global:CustomFilters.Count -gt 0) {
@@ -1771,14 +1997,25 @@ $BtnUpload.Add_Click({
                         }
                         if ($gcloudExcludes.Count -gt 0) {
                             $regex = '(?i)(' + ($gcloudExcludes -join '|') + ')'
-                            $gArgs += "-x"
-                            $gArgs += $regex
+                            $gArgs += " -x `"$regex`""
                         }
                     } else {
-                        $gArgs = @("storage", "cp", $srcTargetSafe, $dstTargetSafe)
+                        $gArgs = "storage cp `"$srcTargetSafe`" `"$dstTargetSafe`""
                     }
-                    if ($Global:AppSettings.IsDebugMode) { $gArgs += "--verbosity=debug" }
-                    $null = $transferCommands.Add((New-TransferCommand -ToolPath $gcloudToolPath -Source $srcTargetSafe -Destination $dstTargetSafe -ArgumentList $gArgs -WorkingDirectory $Global:GCloudBin -Environment $gcloudEnvironment -Description "$srcTargetSafe -> $dstTargetSafe"))
+                    
+                    $projArg = ""
+                    if ($Global:SrcProvider -eq "GCS" -and -not [string]::IsNullOrWhiteSpace($CmbSrcProjList.SelectedItem) -and $CmbSrcProjList.SelectedItem -notmatch "No Project") {
+                        $projArg = " --project=`"$($CmbSrcProjList.SelectedItem)`""
+                    } elseif ($Global:DstProvider -eq "GCS" -and -not [string]::IsNullOrWhiteSpace($CmbDstProjList.SelectedItem) -and $CmbDstProjList.SelectedItem -notmatch "No Project") {
+                        $projArg = " --project=`"$($CmbDstProjList.SelectedItem)`""
+                    }
+                    $gArgs += $projArg
+                    
+                    if ($Global:AppSettings.IsDebugMode) { $gArgs += " --verbosity=debug" }
+                    
+                    $gArgs = $gArgs -replace '%', '%%'
+                    if ($env:CLOUDSDK_PYTHON) { $batContent += "set CLOUDSDK_PYTHON=$env:CLOUDSDK_PYTHON`n" }
+                    $batContent += "$gCmdBase $gArgs >> `"$Global:RunLogFile`" 2>&1`n"
                     
                 } else {
                     $srcTarget = if ($Global:SrcProvider -eq "LOCAL") { Join-Path $rSrcBase $incName } else { "$rSrcBase/$incName" -replace '(?<!:)/{2,}', '/' }
@@ -1790,29 +2027,21 @@ $BtnUpload.Add_Click({
                     $tThreads = $Global:AppSettings.TransferThreads
                     
                     if ($incObj.IsDir) {
-                        $rcloneArgs = @("copy", $srcTargetSafe, $dstTargetSafe, "--create-empty-src-dirs", "-v", "--stats", "30s", "--config", $Global:TempConfig, "--retries", "3", "--low-level-retries", "3", "--contimeout", "30s", "--tpslimit", "$tThreads", "--checkers", "$tThreads", "--transfers", "$tThreads", "--drive-pacer-min-sleep", "50ms")
-                        
-                        if ($Global:SrcProvider -eq "GDRIVE" -and $CmbSrcProjList.SelectedItem -eq "Shared Drive") { $rcloneArgs += "--drive-team-drive=$($Global:DriveMap[$CmbSrcBucList.Text])" }
-                        if ($Global:DstProvider -eq "GDRIVE" -and $CmbDstProjList.SelectedItem -eq "Shared Drive") { $rcloneArgs += "--drive-team-drive=$($Global:DriveMap[$CmbDstBucList.Text])" }
-                        $gcsProj = if ($Global:SrcProvider -eq "GCS") { $CmbSrcProjList.SelectedItem } elseif ($Global:DstProvider -eq "GCS") { $CmbDstProjList.SelectedItem } else { "" }
-                        if ($gcsProj -and $gcsProj -notmatch "No Project") { $rcloneArgs += "--gcs-project-number=$gcsProj" }
-                        if ($Global:SrcProvider -eq "GCS" -or $Global:DstProvider -eq "GCS") { $rcloneArgs += "--gcs-bucket-policy-only" }
+                        $rcloneArgs = @("copy", "`"$srcTargetSafe`"", "`"$dstTargetSafe`"", "--create-empty-src-dirs", "-v", "--stats", "3s", "--config", "`"$Global:TempConfig`"", "--retries", "3", "--low-level-retries", "3", "--contimeout", "30s", "--tpslimit", "$tThreads", "--checkers", "$tThreads", "--transfers", "$tThreads", "--drive-pacer-min-sleep", "50ms")
                     } else {
-                        $rcloneArgs = @("copyto", $srcTargetSafe, $dstTargetSafe, "-v", "--stats", "30s", "--config", $Global:TempConfig, "--retries", "3", "--low-level-retries", "3", "--contimeout", "30s", "--tpslimit", "$tThreads", "--checkers", "$tThreads", "--transfers", "$tThreads", "--drive-pacer-min-sleep", "50ms")
-                        
-                        if ($Global:SrcProvider -eq "GDRIVE" -and $CmbSrcProjList.SelectedItem -eq "Shared Drive") { $rcloneArgs += "--drive-team-drive=$($Global:DriveMap[$CmbSrcBucList.Text])" }
-                        if ($Global:DstProvider -eq "GDRIVE" -and $CmbDstProjList.SelectedItem -eq "Shared Drive") { $rcloneArgs += "--drive-team-drive=$($Global:DriveMap[$CmbDstBucList.Text])" }
-                        $gcsProj = if ($Global:SrcProvider -eq "GCS") { $CmbSrcProjList.SelectedItem } elseif ($Global:DstProvider -eq "GCS") { $CmbDstProjList.SelectedItem } else { "" }
-                        if ($gcsProj -and $gcsProj -notmatch "No Project") { $rcloneArgs += "--gcs-project-number=$gcsProj" }
-                        if ($Global:SrcProvider -eq "GCS" -or $Global:DstProvider -eq "GCS") { $rcloneArgs += "--gcs-bucket-policy-only" }
+                        $rcloneArgs = @("copyto", "`"$srcTargetSafe`"", "`"$dstTargetSafe`"", "-v", "--stats", "3s", "--config", "`"$Global:TempConfig`"", "--retries", "3", "--low-level-retries", "3", "--contimeout", "30s", "--tpslimit", "$tThreads", "--checkers", "$tThreads", "--transfers", "$tThreads", "--drive-pacer-min-sleep", "50ms")
                     }
                     
-                    if ($Global:ExcludeFile) {
+                    $gcsProj = if ($Global:SrcProvider -eq "GCS") { $CmbSrcProjList.SelectedItem } elseif ($Global:DstProvider -eq "GCS") { $CmbDstProjList.SelectedItem } else { "" }
+                    if ($gcsProj -and $gcsProj -notmatch "No Project") { $rcloneArgs += "--gcs-project-number=`"$gcsProj`"" }
+                    if ($Global:SrcProvider -eq "GCS" -or $Global:DstProvider -eq "GCS") { $rcloneArgs += "--gcs-bucket-policy-only" }
+                    
+                    if ($Global:ExcludeFile -and $incObj.IsDir) {
                         $rcloneArgs += "--exclude-from"
-                        $rcloneArgs += $Global:ExcludeFile
+                        $rcloneArgs += "`"$Global:ExcludeFile`""
                     }
 
-                    $null = $transferCommands.Add((New-TransferCommand -ToolPath $Global:RcloneExe -Source $srcTargetSafe -Destination $dstTargetSafe -ArgumentList $rcloneArgs -WorkingDirectory (Split-Path -Path $Global:RcloneExe -Parent) -Description "$srcTargetSafe -> $dstTargetSafe"))
+                    $batContent += "`"$Global:RcloneExe`" " + [string]::Join(' ', $rcloneArgs) + " >> `"$Global:RunLogFile`" 2>&1`n"
                 }
             }
         } else {
@@ -1821,22 +2050,27 @@ $BtnUpload.Add_Click({
                 $srcTargetSafe = if ($Global:SrcProvider -eq "LOCAL" -and $gSrcBase.EndsWith('\')) { $gSrcBase + '\' } else { $gSrcBase }
                 $dstTargetSafe = if ($Global:DstProvider -eq "LOCAL" -and $gDstBase.EndsWith('\')) { $gDstBase + '\' } else { $gDstBase }
                 
-                if ($Global:SrcProvider -eq "LOCAL" -and (Test-Path -LiteralPath $srcTargetSafe) -and (-not $Global:SrcIsFile)) {
+                $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+                $gCmdBase = "call `"$gcloudToolPath`""
+                
+                if ($Global:SrcProvider -eq "LOCAL" -and (-not $Global:SrcIsFile)) {
                     try {
-                        $allDirs = Get-ChildItem -LiteralPath $srcTargetSafe -Recurse -Directory -Force -ErrorAction SilentlyContinue
-                        foreach ($dir in $allDirs) {
-                            $items = Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue
-                            if ($null -eq $items -or $items.Count -eq 0) { $null | Out-File -FilePath (Join-Path $dir.FullName ".placeholder") -Encoding utf8 }
+                        if (Test-Path -LiteralPath $srcTargetSafe -ErrorAction Stop) {
+                            $allDirs = Get-ChildItem -LiteralPath $srcTargetSafe -Recurse -Directory -Force -ErrorAction SilentlyContinue
+                            foreach ($dir in $allDirs) {
+                                $items = Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue
+                                if ($null -eq $items -or $items.Count -eq 0) { $null | Out-File -FilePath (Join-Path $dir.FullName ".placeholder") -Encoding utf8 }
+                            }
+                            $rootItems = Get-ChildItem -LiteralPath $srcTargetSafe -Force -ErrorAction SilentlyContinue
+                            if ($null -eq $rootItems -or $rootItems.Count -eq 0) { $null | Out-File -FilePath (Join-Path $srcTargetSafe ".placeholder") -Encoding utf8 }
                         }
-                        $rootItems = Get-ChildItem -LiteralPath $srcTargetSafe -Force -ErrorAction SilentlyContinue
-                        if ($null -eq $rootItems -or $rootItems.Count -eq 0) { $null | Out-File -FilePath (Join-Path $srcTargetSafe ".placeholder") -Encoding utf8 }
                     } catch {}
                 }
                 
                 if ($Global:SrcIsFile) {
-                    $gArgs = @("storage", "cp", $srcTargetSafe, $dstTargetSafe)
+                    $gArgs = "storage cp `"$srcTargetSafe`" `"$dstTargetSafe`""
                 } else {
-                    $gArgs = @("storage", "rsync", $srcTargetSafe, $dstTargetSafe, "--recursive")
+                    $gArgs = "storage rsync `"$srcTargetSafe`" `"$dstTargetSafe`" --recursive"
                     $gcloudExcludes = @()
                     if ($Global:CustomFilters.Count -gt 0) {
                         foreach ($cf in $Global:CustomFilters) {
@@ -1847,12 +2081,23 @@ $BtnUpload.Add_Click({
                     }
                     if ($gcloudExcludes.Count -gt 0) {
                         $regex = '(?i)(' + ($gcloudExcludes -join '|') + ')'
-                        $gArgs += "-x"
-                        $gArgs += $regex
+                        $gArgs += " -x `"$regex`""
                     }
                 }
-                if ($Global:AppSettings.IsDebugMode) { $gArgs += "--verbosity=debug" }
-                $null = $transferCommands.Add((New-TransferCommand -ToolPath $gcloudToolPath -Source $srcTargetSafe -Destination $dstTargetSafe -ArgumentList $gArgs -WorkingDirectory $Global:GCloudBin -Environment $gcloudEnvironment -Description "$srcTargetSafe -> $dstTargetSafe"))
+                
+                $projArg = ""
+                if ($Global:SrcProvider -eq "GCS" -and -not [string]::IsNullOrWhiteSpace($CmbSrcProjList.SelectedItem) -and $CmbSrcProjList.SelectedItem -notmatch "No Project") {
+                    $projArg = " --project=`"$($CmbSrcProjList.SelectedItem)`""
+                } elseif ($Global:DstProvider -eq "GCS" -and -not [string]::IsNullOrWhiteSpace($CmbDstProjList.SelectedItem) -and $CmbDstProjList.SelectedItem -notmatch "No Project") {
+                    $projArg = " --project=`"$($CmbDstProjList.SelectedItem)`""
+                }
+                $gArgs += $projArg
+
+                if ($Global:AppSettings.IsDebugMode) { $gArgs += " --verbosity=debug" }
+                
+                $gArgs = $gArgs -replace '%', '%%'
+                if ($env:CLOUDSDK_PYTHON) { $batContent += "set CLOUDSDK_PYTHON=$env:CLOUDSDK_PYTHON`n" }
+                $batContent += "$gCmdBase $gArgs >> `"$Global:RunLogFile`" 2>&1`n"
             } else {
                 $rDst = $rDstBase
                 if ($srcName -and $srcName -ne "Root Directory" -and $srcName -notmatch "Multiple Items") {
@@ -1861,94 +2106,315 @@ $BtnUpload.Add_Click({
                 $srcTargetSafe = if ($Global:SrcProvider -eq "LOCAL" -and $rSrcBase.EndsWith('\')) { $rSrcBase + '\' } else { $rSrcBase }
                 $dstTargetSafe = if ($Global:DstProvider -eq "LOCAL" -and $rDst.EndsWith('\')) { $rDst + '\' } else { $rDst }
                 
+                $rLogLevel = if ($Global:AppSettings.IsDebugMode) { "DEBUG" } else { "INFO" }
                 $tThreads = $Global:AppSettings.TransferThreads
                 
-                $rcloneArgs = @("copy", $srcTargetSafe, $dstTargetSafe, "--create-empty-src-dirs", "-v", "--stats", "30s", "--config", $Global:TempConfig, "--retries", "3", "--low-level-retries", "3", "--contimeout", "30s", "--tpslimit", "$tThreads", "--checkers", "$tThreads", "--transfers", "$tThreads", "--drive-pacer-min-sleep", "50ms")
+                if ($Global:SrcIsFile) {
+                    $rcloneArgs = @("copyto", "`"$srcTargetSafe`"", "`"$dstTargetSafe`"", "-v", "--stats", "3s", "--config", "`"$Global:TempConfig`"", "--retries", "3", "--low-level-retries", "3", "--contimeout", "30s", "--tpslimit", "$tThreads", "--checkers", "$tThreads", "--transfers", "$tThreads", "--drive-pacer-min-sleep", "50ms")
+                } else {
+                    $rcloneArgs = @("copy", "`"$srcTargetSafe`"", "`"$dstTargetSafe`"", "--create-empty-src-dirs", "-v", "--stats", "3s", "--config", "`"$Global:TempConfig`"", "--retries", "3", "--low-level-retries", "3", "--contimeout", "30s", "--tpslimit", "$tThreads", "--checkers", "$tThreads", "--transfers", "$tThreads", "--drive-pacer-min-sleep", "50ms")
+                }
                 
-                if ($Global:SrcProvider -eq "GDRIVE" -and $CmbSrcProjList.SelectedItem -eq "Shared Drive") { $rcloneArgs += "--drive-team-drive=$($Global:DriveMap[$CmbSrcBucList.Text])" }
-                if ($Global:DstProvider -eq "GDRIVE" -and $CmbDstProjList.SelectedItem -eq "Shared Drive") { $rcloneArgs += "--drive-team-drive=$($Global:DriveMap[$CmbDstBucList.Text])" }
                 $gcsProj = if ($Global:SrcProvider -eq "GCS") { $CmbSrcProjList.SelectedItem } elseif ($Global:DstProvider -eq "GCS") { $CmbDstProjList.SelectedItem } else { "" }
-                if ($gcsProj -and $gcsProj -notmatch "No Project") { $rcloneArgs += "--gcs-project-number=$gcsProj" }
+                if ($gcsProj -and $gcsProj -notmatch "No Project") { $rcloneArgs += "--gcs-project-number=`"$gcsProj`"" }
                 if ($Global:SrcProvider -eq "GCS" -or $Global:DstProvider -eq "GCS") { $rcloneArgs += "--gcs-bucket-policy-only" }
-
-                if ($Global:ExcludeFile) {
+                
+                if ($Global:ExcludeFile -and -not $Global:SrcIsFile) {
                     $rcloneArgs += "--exclude-from"
-                    $rcloneArgs += $Global:ExcludeFile
+                    $rcloneArgs += "`"$Global:ExcludeFile`""
                 }
 
-                $null = $transferCommands.Add((New-TransferCommand -ToolPath $Global:RcloneExe -Source $srcTargetSafe -Destination $dstTargetSafe -ArgumentList $rcloneArgs -WorkingDirectory (Split-Path -Path $Global:RcloneExe -Parent) -Description "$srcTargetSafe -> $dstTargetSafe"))
+                $batContent += "`"$Global:RcloneExe`" " + [string]::Join(' ', $rcloneArgs) + " >> `"$Global:RunLogFile`" 2>&1`n"
             }
         }
 
-        if ($transferCommands.Count -eq 0) {
-            Log-Message "No transfer commands were generated. Review the current selection." "LightCoral"
-            Restore-TransferUiState
-            return
-        }
+        try { [System.IO.File]::WriteAllText($Global:BatFile, $batContent, (New-Object System.Text.UTF8Encoding $false)) } catch {}
 
-        $transferJob = [TransferJob]::new()
-        $transferJob.Source = if ($UseGCloud) { $gSrcBase } else { $rSrcBase }
-        $transferJob.Destination = if ($UseGCloud) { $gDstBase } else { $rDstBase }
-        $transferJob.ToolPath = if ($UseGCloud) { $gcloudToolPath } else { $Global:RcloneExe }
-        $transferJob.DisplayName = $displayName
-        $transferJob.TotalItems = $Global:TotalTransferItems
-        $transferJob.ExcludeFile = $Global:ExcludeFile
-        $transferJob.Commands = $transferCommands.ToArray()
+        $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pInfo.FileName = "cmd.exe"
+        $pInfo.Arguments = "/c `"$Global:BatFile`""
+        $pInfo.UseShellExecute = $false
+        $pInfo.CreateNoWindow = $true
+        
+        $Global:CurrentProcess = New-Object System.Diagnostics.Process; $Global:CurrentProcess.StartInfo = $pInfo; 
+        $Global:CurrentProcess.Start() | Out-Null
+        
+        $lastSize = 0
+        [int]$RegCopied = 0; [int]$RegFailed = 0; [bool]$QuotaReached = $false; [bool]$ProcessFailed = $false
+        
+        while (-not $Global:CurrentProcess.HasExited) { 
+            
+            $fileInfo = Get-Item -LiteralPath $Global:RunLogFile -ErrorAction SilentlyContinue
+            if ($fileInfo -and $fileInfo.Length -gt $lastSize) {
+                try {
+                    $fs = New-Object System.IO.FileStream($Global:RunLogFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                    $fs.Seek($lastSize, [System.IO.SeekOrigin]::Begin) | Out-Null
+                    $sr = New-Object System.IO.StreamReader($fs)
+                    
+                    while (-not $sr.EndOfStream) {
+                        $line = $sr.ReadLine()
+                        if (-not [string]::IsNullOrWhiteSpace($line)) {
+                            $l = $line.Trim()
 
-        $runtime = Invoke-TransferJob -TransferJob $transferJob
-        $Global:ActiveTransfer = [PSCustomObject]@{
-            Job = $transferJob
-            Queue = $runtime.Queue
-            State = $runtime.State
-            Runspace = $runtime.Runspace
-            PowerShell = $runtime.PowerShell
-            AsyncResult = $runtime.AsyncResult
-            Stopwatch = $transferStopwatch
-            ReportLog = $ReportLog
-            DisplayName = $displayName
-            StartTimeSafe = $startTimeSafe
-            RegCopied = 0
-            RegFailed = 0
-            QuotaReached = $false
-            ProcessFailed = $false
-            ExitCode = $null
-            Finalized = $false
-            TotalSourceItems = $Global:TotalTransferItems
-            RunLogFile = $Global:RunLogFile
-        }
+                            $isUpdate = $false
 
-        $Global:TransferUiTimer.Start()
-        return
-    }
+                            if ($l -match "(?i)userRateLimitExceeded|upload limit error|quota exceeded|RATE_LIMIT_EXCEEDED|rateLimitExceeded") {
+                                if (-not $QuotaReached) { Log-Message "QUOTA LIMIT REACHED. Transfer safely stopped." "Yellow"; $QuotaReached = $true; $Global:StopTransfer = $true; try { Start-Process "taskkill.exe" -ArgumentList "/PID $($Global:CurrentProcess.Id) /T /F" -WindowStyle Hidden -Wait } catch {} }
+                            }
 
-    if ($Global:CurrentTaskId) {
-        for ($i = 0; $i -lt $Global:Tasks.Count; $i++) {
-            if ($Global:Tasks[$i].Id -eq $Global:CurrentTaskId) {
-                $Global:Tasks[$i].Status = "Error"
-                $Global:Tasks[$i].LogData = $RtbLog.Text
-                break
+                            if ($l -match 'Transferred:.*?,\s*(\d{1,3})%,\s*([\d\.]+\s*[kKMGT]?i?B/s)') {
+                                $lastTransferSpeed = $Matches[2]
+                                if ($Global:TotalTransferItems -le 0) {
+                                    $pct = [int]$Matches[1]
+                                    $Global:TransferSpeed = $lastTransferSpeed
+                                    if ($pct -ge 0 -and $pct -le 100) {
+                                        $PrgTotal.Style = "Continuous"
+                                        if ($pct -lt 100 -and $pct -gt 0) { $PrgTotal.Value = $pct + 1; $PrgTotal.Value = $pct } else { $PrgTotal.Value = $pct }
+                                        $LblProgress.Text = "Progress ($displayName): $pct%"
+                                    }
+                                }
+                            }
+
+                            if ($l -match '^Transferred:\s+(\d+)\s*/\s*(\d+),\s*\d{1,3}%$') {
+                                if ($Global:TotalTransferItems -le 0) { $LblFolderCount.Text = "Item(s): $($Matches[1]) out of $($Matches[2])" }
+                            }
+
+                            if ($l -match "(?i)INFO\s+:\s+(.+?):\s+Copied") {
+                                $relPath = $Matches[1]
+                                $srcFull = ($rSrcBase.TrimEnd('/\') + "/$relPath") -replace '(?<!:)/{2,}', '/'
+                                $dstFull = ($rDstBase.TrimEnd('/\') + "/$relPath") -replace '(?<!:)/{2,}', '/'
+                                $speedStr = if ($lastTransferSpeed) { "  |  Speed: $lastTransferSpeed" } else { "" }
+                                Log-Message "From: $srcFull -> $dstFull$speedStr" "LightGreen"
+                                $RegCopied++; $isUpdate = $true
+                            } elseif ($l -match "Copying\s+(\S+)\s+to\s+(\S+)") {
+                                $srcFull = $Matches[1]; $dstFull = $Matches[2]
+                                Log-Message "From: $srcFull -> $dstFull" "LightGreen"
+                                $RegCopied++; $isUpdate = $true
+                            } elseif ($l -match "(?i)INFO\s+:\s+(.+?):\s+Unchanged skipping") {
+                                $relPath = $Matches[1]
+                                $srcFull = ($rSrcBase.TrimEnd('/\') + "/$relPath") -replace '(?<!:)/{2,}', '/'
+                                $dstFull = ($rDstBase.TrimEnd('/\') + "/$relPath") -replace '(?<!:)/{2,}', '/'
+                                Log-Message "Skip: $srcFull -> $dstFull  |  Unchanged" "DarkGray"
+                                $isUpdate = $true
+                            } elseif ($l -match "Skipping existing(?: destination)? item\s+(.+)") {
+                                Log-Message "Skip: $($Matches[1])  |  Unchanged" "DarkGray"
+                                $isUpdate = $true
+                            } elseif ($l -match "(?i)ERROR\s+:\s+(.+?):\s+(.+)" -or $l -match "ERROR:\s+(.+)" -or $l -match "(?i)CRITICAL(.*?):\s+(.+)") {
+                                Log-Message $l "LightCoral"
+                                $RegFailed++; $isUpdate = $true
+                            } elseif ($l -match "^(Transferred:|Checks:|Elapsed time:)") {
+                                Log-Message $l "DarkGray"
+                            } else {
+                                $logColor = if ($l -match "ERROR" -or $l -match "CRITICAL") { "LightCoral" } else { "White" }
+                                Log-Message $l $logColor
+                            }
+
+                            if ($isUpdate) {
+                                $totalPro = $RegCopied + $RegFailed
+                                if ($Global:TotalTransferItems -gt 0) {
+                                    $pct = [math]::Round(($totalPro / $Global:TotalTransferItems) * 100)
+                                    if ($pct -gt 100) { $pct = 100 }
+                                    $PrgTotal.Style = "Continuous"
+                                    if ($pct -lt 100 -and $pct -gt 0) { $PrgTotal.Value = $pct + 1; $PrgTotal.Value = $pct } else { $PrgTotal.Value = $pct }
+                                    $LblProgress.Text = "Progress ($displayName): $pct%"
+                                    $LblFolderCount.Text = "Item(s): $totalPro out of $($Global:TotalTransferItems)"
+                                } else {
+                                    $LblFolderCount.Text = "Item(s) Processed: $totalPro"
+                                }
+                            }
+                        }
+                    }
+                    $lastSize = $fs.Position
+                    $sr.Close(); $fs.Close()
+                } catch { } 
             }
+            
+            [System.Windows.Forms.Application]::DoEvents()
+            
+            if ($Global:StopTransfer) { 
+                if (-not $Global:CurrentProcess.HasExited) {
+                    try { Start-Process "taskkill.exe" -ArgumentList "/PID $($Global:CurrentProcess.Id) /T /F" -WindowStyle Hidden -Wait } catch {}
+                }
+                break 
+            }
+            
+            [System.Threading.Thread]::Sleep(100)
         }
-        Save-Tasks
-        Sync-TasksToUI
+
+        $fileInfo = Get-Item -LiteralPath $Global:RunLogFile -ErrorAction SilentlyContinue
+        if ($fileInfo -and $fileInfo.Length -gt $lastSize) {
+            try {
+                $fs = New-Object System.IO.FileStream($Global:RunLogFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $fs.Seek($lastSize, [System.IO.SeekOrigin]::Begin) | Out-Null
+                $sr = New-Object System.IO.StreamReader($fs); while (-not $sr.EndOfStream) { 
+                    $line = $sr.ReadLine(); 
+                    if (![string]::IsNullOrWhiteSpace($line)) { 
+                        $l = $line.Trim()
+                        if ($l -match "(?i)INFO\s+:\s+(.+?):\s+Copied") {
+                            $relPath = $Matches[1]
+                            $srcFull = ($rSrcBase.TrimEnd('/\') + "/$relPath") -replace '(?<!:)/{2,}', '/'
+                            $dstFull = ($rDstBase.TrimEnd('/\') + "/$relPath") -replace '(?<!:)/{2,}', '/'
+                            $speedStr = if ($lastTransferSpeed) { "  |  Speed: $lastTransferSpeed" } else { "" }
+                            Log-Message "From: $srcFull -> $dstFull$speedStr" "LightGreen"
+                            $RegCopied++
+                        } elseif ($l -match "Copying\s+(\S+)\s+to\s+(\S+)") {
+                            $srcFull = $Matches[1]; $dstFull = $Matches[2]
+                            Log-Message "From: $srcFull -> $dstFull" "LightGreen"
+                            $RegCopied++
+                        } elseif ($l -match "(?i)ERROR\s+:\s+(.+?):\s+(.+)" -or $l -match "ERROR:\s+(.+)" -or $l -match "(?i)CRITICAL(.*?):\s+(.+)") {
+                            Log-Message $l "LightCoral"
+                            $RegFailed++
+                        } elseif ($l -match "^(Transferred:|Checks:|Elapsed time:)") {
+                            Log-Message $l "DarkGray"
+                        } else {
+                            $logColor = if ($l -match "ERROR" -or $l -match "CRITICAL") { "LightCoral" } else { "White" }
+                            Log-Message $l $logColor
+                        }
+                    } 
+                }
+                $sr.Close(); $fs.Close()
+            } catch {}
+        }
+        
+        if ($Global:CurrentProcess.ExitCode -notin @(0, 1, 9)) {
+            $ProcessFailed = $true
+            if (-not $QuotaReached) { Log-Message "Process finished with errors (Exit Code: $($Global:CurrentProcess.ExitCode)). Review log above." "LightCoral" }
+        }
+
+        $PrgTotal.Style = "Continuous"; $PrgTotal.Value = 100
+        if ($Global:StopTransfer) { 
+            $LblProgress.Text = "Transfer Aborted" 
+        } else { 
+            $LblProgress.Text = "Progress (Complete) ================= 100%" 
+        }
+        
+        $TotalSourceItems = $Global:TotalTransferItems
+        $RegSkipped = [math]::Max(0, ($TotalSourceItems - $RegCopied - $RegFailed))
+        
+        if ($LblFolderCount.Text -match "Calculating" -or $Global:TotalTransferItems -gt 0) {
+            $totalPro = $RegCopied + $RegFailed
+            $LblFolderCount.Text = "Item(s) Processed: $totalPro"
+        }
+        
+        $transferStopwatch.Stop()
+        
+        $cleanTaskName = $TxtTaskName.Text -replace '[\\/:*?"<>|]', '_'
+        $logDir = "C:\data_transfer_log\"
+        if (-not (Test-Path -LiteralPath $logDir)) { try { New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null } catch {} }
+        
+        if ($existing -and -not [string]::IsNullOrWhiteSpace($existing.LogFilePath)) {
+            $logPath = $existing.LogFilePath
+        } else {
+            $logPath = Join-Path $logDir "${cleanTaskName}_${startTimeSafe}.txt"
+        }
+        
+        $finalStatus = if ($QuotaReached) { "Error" } elseif ($Global:StopTransfer) { "Aborted" } elseif ($RegFailed -gt 0 -or $ProcessFailed) { "Error" } else { "Completed" }
+        $totalProcessed = $RegCopied + $RegSkipped + $RegFailed
+
+        # Show summary in live log
+        $summaryLines = @(
+            ""
+            "================================================="
+            "TRANSFER COMPLETE - SUMMARY"
+            "================================================="
+            "Task:             $($TxtTaskName.Text)"
+            "Status:           $finalStatus"
+            "Duration:         $($transferStopwatch.Elapsed.ToString('hh\:mm\:ss'))"
+            "Avg Speed:        $Global:TransferSpeed"
+            "-------------------------------------------------"
+            "Source Items    : $TotalSourceItems"
+            "Copied          : $RegCopied"
+            "Skipped         : $RegSkipped"
+            "Failed          : $RegFailed"
+            "Total Processed : $totalProcessed"
+            "================================================="
+        )
+        $summaryColor = if ($finalStatus -eq "Error") { "LightCoral" } elseif ($finalStatus -eq "Aborted") { "Yellow" } else { "Cyan" }
+        foreach ($sl in $summaryLines) { Log-Message $sl $summaryColor }
+
+        $CleanLogString = if ($Global:FullLogLines -and $Global:FullLogLines.Count -gt 0) { $Global:FullLogLines -join "`n" } else { $RtbLog.Text }
+
+        $Summary = @"
+=================================================
+AUDIT SUMMARY: Data Transfer Tool
+=================================================
+Task Name: $($TxtTaskName.Text)
+Status: $finalStatus
+Session Duration: $($transferStopwatch.Elapsed.ToString("hh\:mm\:ss"))
+Source: $Global:SrcProvider | Dest: $Global:DstProvider
+Exit Code: $($Global:CurrentProcess.ExitCode)
+Average Speed: $Global:TransferSpeed
+
+SESSION METRICS:
+- Total Items in Source: $TotalSourceItems
+- Copied: $RegCopied
+- Skipped: $RegSkipped
+- Failed: $RegFailed
+- Total Processed: $totalProcessed
+
+=================================================
+CUMULATIVE DETAILED TRANSFER LOG:
+=================================================
+$CleanLogString
+"@
+        
+        try { $Summary | Out-File -LiteralPath $logPath -Encoding utf8 -ErrorAction Stop } catch {}
+        Log-Message "Summary File Saved: $logPath" "Cyan"
+        
+        if ($Global:CurrentTaskId) { 
+            for ($i = 0; $i -lt $Global:Tasks.Count; $i++) {
+                if ($Global:Tasks[$i].Id -eq $Global:CurrentTaskId) {
+                    $Global:Tasks[$i].Status = $finalStatus
+                    $Global:Tasks[$i].CompleteDate = (Get-Date -Format "MM/dd/yyyy HH:mm")
+                    $Global:Tasks[$i].LogData = $CleanLogString
+                    $Global:Tasks[$i].LogFilePath = $logPath 
+                    break
+                }
+            }
+            Save-Tasks; Sync-TasksToUI 
+        }
     }
 
-    Restore-TransferUiState
+    try {
+        if (![string]::IsNullOrEmpty($Global:ExcludeFile) -and (Test-Path -LiteralPath $Global:ExcludeFile -ErrorAction Stop)) { Remove-Item -LiteralPath $Global:ExcludeFile -Force -ErrorAction SilentlyContinue }
+        if (![string]::IsNullOrEmpty($Global:BatFile) -and (Test-Path -LiteralPath $Global:BatFile -ErrorAction Stop)) { Remove-Item -LiteralPath $Global:BatFile -Force -ErrorAction SilentlyContinue }
+    } catch {}
+
+    $Global:IsTransferring = $false
+    $Global:CurrentProcess = $null
+    
+    $LvwTasks.BackColor = $InputColor
+    $ChkExclusions.BackColor = $InputColor
+    $LbxSrcDir.BackColor = $InputColor
+    $LbxDstDir.BackColor = $InputColor
+    
+    $BtnNewTask.Enabled = $true; $BtnDelTask.Enabled = $true; $BtnClearAll.Enabled = $true; $BtnDuplicate.Enabled = $true
+    $BtnSrcLoc.Enabled = $true; $BtnSrcFilter.Enabled = $true; $BtnDstLoc.Enabled = $true; $BtnDstNewF.Enabled = $true; $BtnDstRef.Enabled = $true
+    $BtnUpload.Enabled = $true; $BtnCheckAll.Enabled = $true; $BtnUncheckAll.Enabled = $true
+    $BtnStop.Enabled = $false
 })
 
 $Form.Add_FormClosing({
-    Stop-ActiveTransferProcess
+    if ($Global:CurrentProcess -and -not $Global:CurrentProcess.HasExited) {
+        try { Start-Process "taskkill.exe" -ArgumentList "/PID $($Global:CurrentProcess.Id) /T /F" -WindowStyle Hidden -Wait } catch {}
+    }
     try {
-        if (![string]::IsNullOrEmpty($Global:JsonTempFile) -and (Test-Path -LiteralPath $Global:JsonTempFile)) { Remove-Item -LiteralPath $Global:JsonTempFile -Force -ErrorAction SilentlyContinue }
-        if (![string]::IsNullOrEmpty($Global:RunLogFile) -and (Test-Path -LiteralPath $Global:RunLogFile)) { Remove-Item -LiteralPath $Global:RunLogFile -Force -ErrorAction SilentlyContinue }
-        if (![string]::IsNullOrEmpty($Global:ExcludeFile) -and (Test-Path -LiteralPath $Global:ExcludeFile)) { Remove-Item -LiteralPath $Global:ExcludeFile -Force -ErrorAction SilentlyContinue }
+        if (![string]::IsNullOrEmpty($Global:JsonTempFile) -and (Test-Path -LiteralPath $Global:JsonTempFile -ErrorAction Stop)) { Remove-Item -LiteralPath $Global:JsonTempFile -Force -ErrorAction SilentlyContinue }
+        if (![string]::IsNullOrEmpty($Global:RunLogFile) -and (Test-Path -LiteralPath $Global:RunLogFile -ErrorAction Stop)) { Remove-Item -LiteralPath $Global:RunLogFile -Force -ErrorAction SilentlyContinue }
+        if (![string]::IsNullOrEmpty($Global:ExcludeFile) -and (Test-Path -LiteralPath $Global:ExcludeFile -ErrorAction Stop)) { Remove-Item -LiteralPath $Global:ExcludeFile -Force -ErrorAction SilentlyContinue }
+        if (![string]::IsNullOrEmpty($Global:BatFile) -and (Test-Path -LiteralPath $Global:BatFile -ErrorAction Stop)) { Remove-Item -LiteralPath $Global:BatFile -Force -ErrorAction SilentlyContinue }
     } catch {}
 })
 
 $BtnStop.Add_Click({ 
-    if ($Global:ActiveTransfer) { 
+    if ($Global:CurrentProcess) { 
         if ([System.Windows.Forms.MessageBox]::Show("Are you sure you want to abort the current transfer?", "Confirm Abort", "YesNo", "Warning") -eq "Yes") { 
-            Stop-ActiveTransferProcess
+            $Global:StopTransfer = $true
+            try { 
+                if (-not $Global:CurrentProcess.HasExited) { 
+                    Start-Process "taskkill.exe" -ArgumentList "/PID $($Global:CurrentProcess.Id) /T /F" -WindowStyle Hidden -Wait
+                } 
+            } catch {} 
         } 
     } 
 })
