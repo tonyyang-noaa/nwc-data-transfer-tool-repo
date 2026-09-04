@@ -60,7 +60,7 @@ $Global:DefaultFilters = @(
 )
 
 # UI FIX 1: Set Default Theme to Light Mode (IsDarkMode = $false)
-$Global:AppSettings = [PSCustomObject]@{ RclonePath = ""; GCloudPath = ""; IsDarkMode = $false; IsDebugMode = $false; TransferThreads = 3; CustomFilters = @(); DriveClientId = ""; DriveClientSecret = "" }
+$Global:AppSettings = [PSCustomObject]@{ RclonePath = ""; GCloudPath = ""; IsDarkMode = $false; IsDebugMode = $false; TransferThreads = 3; CustomFilters = @(); DriveClientId = ""; DriveClientSecret = ""; GcsAuthType = "UserOAuth"; GcsServiceAccountKeyPath = ""; ForceRcloneGcs = $false }
 
 # Dual Engine States
 $Global:SrcProvider = ""; $Global:DstProvider = ""
@@ -82,6 +82,11 @@ try { Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion
 try { Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\python3.exe" -Name "(Default)" -ErrorAction Stop } catch {}
 
 function Load-Settings {
+    # Self-heal missing properties to prevent silent save failures
+    if (-not (Get-Member -InputObject $Global:AppSettings -Name "ForceRcloneGcs" -ErrorAction SilentlyContinue)) {
+        $Global:AppSettings | Add-Member -MemberType NoteProperty -Name "ForceRcloneGcs" -Value $false
+    }
+    
     try {
         if (Test-Path -LiteralPath $Global:SettingsFile -ErrorAction Stop) {
             $loaded = Get-Content -Raw -LiteralPath $Global:SettingsFile | ConvertFrom-Json 
@@ -93,6 +98,9 @@ function Load-Settings {
             if ($loaded.CustomFilters) { $Global:AppSettings.CustomFilters = $loaded.CustomFilters }
             if ($loaded.DriveClientId) { $Global:AppSettings.DriveClientId = $loaded.DriveClientId }
             if ($loaded.DriveClientSecret) { $Global:AppSettings.DriveClientSecret = $loaded.DriveClientSecret }
+            if ($loaded.GcsAuthType) { $Global:AppSettings.GcsAuthType = $loaded.GcsAuthType }
+            if ($loaded.GcsServiceAccountKeyPath) { $Global:AppSettings.GcsServiceAccountKeyPath = $loaded.GcsServiceAccountKeyPath }
+            if ($null -ne $loaded.ForceRcloneGcs) { $Global:AppSettings.ForceRcloneGcs = [bool]$loaded.ForceRcloneGcs }
         }
     } catch {}
 }
@@ -104,6 +112,71 @@ if ($null -eq $Global:AppSettings.CustomFilters -or $Global:AppSettings.CustomFi
     $Global:AppSettings.CustomFilters = $Global:DefaultFilters
 }
 $Global:CustomFilters = $Global:AppSettings.CustomFilters
+
+function Get-GcsServiceAccountInfo([string]$KeyPath) {
+    if ([string]::IsNullOrWhiteSpace($KeyPath) -or -not (Test-Path -LiteralPath $KeyPath)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $KeyPath -Raw -ErrorAction Stop
+        $json = $raw | ConvertFrom-Json -ErrorAction Stop
+        if ($json.type -eq "service_account" -and $json.client_email) {
+            return [PSCustomObject]@{
+                client_email = $json.client_email
+                project_id   = $json.project_id
+                private_key_id = $json.private_key_id
+            }
+        }
+    } catch {}
+    return $null
+}
+
+function Activate-GcsServiceAccount([string]$KeyPath) {
+    if ([string]::IsNullOrWhiteSpace($KeyPath) -or -not (Test-Path -LiteralPath $KeyPath)) { return $false }
+    $info = Get-GcsServiceAccountInfo $KeyPath
+    if (-not $info) { return $false }
+
+    $gcmd = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+    try {
+        $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pInfo.FileName = "cmd.exe"
+        $pInfo.Arguments = "/c `"`"$gcmd`" auth activate-service-account --key-file=`"$KeyPath`"`""
+        $pInfo.UseShellExecute = $false
+        $pInfo.CreateNoWindow = $true
+        $pInfo.WorkingDirectory = $env:TEMP
+        $p = [System.Diagnostics.Process]::Start($pInfo)
+        $p.WaitForExit()
+        if ($p.ExitCode -eq 0) {
+            $Global:AppSettings.GcsAuthType = "ServiceAccount"
+            $Global:AppSettings.GcsServiceAccountKeyPath = $KeyPath
+            $env:GOOGLE_APPLICATION_CREDENTIALS = $KeyPath
+            Save-Settings
+            Set-RcloneEnvironment
+            return $true
+        }
+    } catch {}
+    return $false
+}
+
+function Revoke-GcsServiceAccount {
+    $gcmd = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+    try {
+        $info = Get-GcsServiceAccountInfo $Global:AppSettings.GcsServiceAccountKeyPath
+        $acc = if ($info -and $info.client_email) { $info.client_email } else { "" }
+        $arg = if ($acc) { "auth revoke `"$acc`" --quiet" } else { "auth revoke --all --quiet" }
+        $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pInfo.FileName = "cmd.exe"
+        $pInfo.Arguments = "/c `"`"$gcmd`" $arg`""
+        $pInfo.UseShellExecute = $false
+        $pInfo.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($pInfo)
+        $p.WaitForExit()
+    } catch {}
+
+    $Global:AppSettings.GcsServiceAccountKeyPath = ""
+    try { Remove-Item Env:GOOGLE_APPLICATION_CREDENTIALS -ErrorAction SilentlyContinue } catch {}
+    Save-Settings
+    Set-RcloneEnvironment
+    Set-GCloudEnvironment
+}
 
 function Set-RcloneEnvironment {
     $Global:RcloneExe = ""
@@ -133,18 +206,26 @@ function Set-RcloneEnvironment {
     }
     
     if ($Global:RcloneExe) {
-        $confStr = @"
-[$Global:GcsBridgeName]
-type = google cloud storage
-env_auth = true
-"@
+        $saKeyOption = ""
+        if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount" -and !([string]::IsNullOrWhiteSpace($Global:AppSettings.GcsServiceAccountKeyPath)) -and (Test-Path -LiteralPath $Global:AppSettings.GcsServiceAccountKeyPath -ErrorAction SilentlyContinue)) {
+            $escapedKey = $Global:AppSettings.GcsServiceAccountKeyPath -replace '\\', '/'
+            $saKeyOption = "`nservice_account_file = $escapedKey"
+        }
+        if ($Global:AppSettings.ForceRcloneGcs -and $Global:AppSettings.GcsAuthType -eq "UserOAuth") {
+        # Let Rclone manage its own OAuth token
+    } else {
+        $confStr = "[$Global:GcsBridgeName]`ntype = google cloud storage`nenv_auth = true`nbucket_policy_only = true$saKeyOption`n"
         try {
-            if (-not (Test-Path $Global:TempConfig -ErrorAction Stop)) { 
-                $confStr | Out-File $Global:TempConfig -Encoding utf8 
-            } elseif ((Get-Content $Global:TempConfig -Raw) -notmatch "\[$Global:GcsBridgeName\]") { 
-                Add-Content -Path $Global:TempConfig -Value "`n$confStr" 
+            if (-not (Test-Path -LiteralPath $Global:TempConfig -ErrorAction Stop)) { 
+                $confStr | Out-File -LiteralPath $Global:TempConfig -Encoding utf8 -Force
+            } else {
+                $currentCfg = Get-Content -LiteralPath $Global:TempConfig -Raw
+                $newCfg = [regex]::Replace($currentCfg, "(?ms)\[$([regex]::Escape($Global:GcsBridgeName))\].*?(?=(\[[^\]]+\]|\z))", "")
+                $newCfg = $newCfg.Trim() + "`n`n" + $confStr.Trim() + "`n"
+                $newCfg | Out-File -LiteralPath $Global:TempConfig -Encoding utf8 -Force
             }
         } catch {}
+    }
     }
 }
 
@@ -188,10 +269,14 @@ function Set-GCloudEnvironment {
         } catch {}
     }
     
-    $adcPath = Join-Path $env:APPDATA "gcloud\application_default_credentials.json"
-    try {
-        if (Test-Path $adcPath -ErrorAction Stop) { $env:GOOGLE_APPLICATION_CREDENTIALS = $adcPath }
-    } catch {}
+    if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount" -and !([string]::IsNullOrWhiteSpace($Global:AppSettings.GcsServiceAccountKeyPath)) -and (Test-Path -LiteralPath $Global:AppSettings.GcsServiceAccountKeyPath -ErrorAction SilentlyContinue)) {
+        $env:GOOGLE_APPLICATION_CREDENTIALS = $Global:AppSettings.GcsServiceAccountKeyPath
+    } else {
+        $adcPath = Join-Path $env:APPDATA "gcloud\application_default_credentials.json"
+        try {
+            if (Test-Path $adcPath -ErrorAction Stop) { $env:GOOGLE_APPLICATION_CREDENTIALS = $adcPath }
+        } catch {}
+    }
 }
 
 Set-RcloneEnvironment; Set-GCloudEnvironment
@@ -211,7 +296,7 @@ function Save-Tasks { $Global:Tasks | ConvertTo-Json -Depth 10 | Out-File -Liter
 
 # --- 2. GUI INITIALIZATION (SIDE-BY-SIDE LAYOUT) ---
 $Form = New-Object System.Windows.Forms.Form
-$Form.Text = "Data Transfer Tool v1.1.43"
+$Form.Text = "Data Transfer Tool v1.1.50"
 $ScreenArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $AppWidth = 1250; $AppHeight = if ($ScreenArea.Height -lt 850) { [math]::Max(750, $ScreenArea.Height - 50) } else { 850 }
 $Form.ClientSize = New-Object System.Drawing.Size($AppWidth, $AppHeight)
@@ -297,6 +382,7 @@ function Build-BrowserPanel($Panel, $TitleStr, $Prefix) {
     
     $CmbProv = New-Object System.Windows.Forms.ComboBox; $CmbProv.Location = New-Object System.Drawing.Point(125, ($yOff - 3)); $CmbProv.Size = New-Object System.Drawing.Size(250, 25); $CmbProv.DropDownStyle = "DropDownList"; $CmbProv.BackColor = $InputColor; $CmbProv.ForeColor = $TextColor; $CmbProv.FlatStyle = "Flat"; [void]$CmbProv.Items.AddRange(@("--- Select Storage ---", "Google Cloud Storage", "Google Drive", "Local Storage")); $CmbProv.SelectedIndex = 0; $CmbProv.Anchor = "Top, Left"; $PTop.Controls.Add($CmbProv)
     
+    $CmbAuth = New-Object System.Windows.Forms.ComboBox; $CmbAuth.Location = New-Object System.Drawing.Point(5, ($yOff + 26)); $CmbAuth.Size = New-Object System.Drawing.Size(160, 25); $CmbAuth.DropDownStyle = "DropDownList"; $CmbAuth.BackColor = $InputColor; $CmbAuth.ForeColor = $TextColor; $CmbAuth.FlatStyle = "Flat"; [void]$CmbAuth.Items.AddRange(@("User Account (OAuth)", "Service Account (.json)")); $CmbAuth.SelectedIndex = 0; $CmbAuth.Visible = $false; $CmbAuth.Anchor = "Top, Left"; $PTop.Controls.Add($CmbAuth)
     $BtnAu = New-Object System.Windows.Forms.Button; $BtnAu.Text = "Login/Auth"; $BtnAu.Location = New-Object System.Drawing.Point(5, ($yOff + 26)); $BtnAu.Size = New-Object System.Drawing.Size(95, 25); $BtnAu.Enabled = $false; Set-FlatButton $BtnAu; $PTop.Controls.Add($BtnAu)
     $BtnOut = New-Object System.Windows.Forms.Button; $BtnOut.Text = "Sign Out"; $BtnOut.Location = New-Object System.Drawing.Point(105, ($yOff + 26)); $BtnOut.Size = New-Object System.Drawing.Size(85, 25); $BtnOut.Enabled = $false; $BtnOut.Visible = $false; Set-FlatButton $BtnOut; $PTop.Controls.Add($BtnOut)
     $LblStat = New-Object System.Windows.Forms.Label; $LblStat.Text = "Not Connected"; $LblStat.ForeColor = "LightCoral"; $LblStat.Location = New-Object System.Drawing.Point(195, ($yOff + 30)); $LblStat.AutoSize = $true; $PTop.Controls.Add($LblStat)
@@ -356,18 +442,16 @@ function Build-BrowserPanel($Panel, $TitleStr, $Prefix) {
         if ($e.KeyCode -eq 'Enter') {
             $e.SuppressKeyPress = $true
             $IsSource = ($sender -eq $Global:CmbSrcBucList)
-            $locProj = if ($IsSource) { $Global:CmbSrcProjList } else { $Global:CmbDstProjList }
             $locLbx  = if ($IsSource) { $Global:LbxSrcDir } else { $Global:LbxDstDir }
-            if ($locProj.SelectedItem -eq "[ No Project ID (Manual) ]") {
-                $val = $sender.Text.Trim(); if (![string]::IsNullOrWhiteSpace($val) -and $val -notmatch "Type Bucket") {
-                    $locLbx.Enabled = $true
-                    if ($IsSource) { $Global:SrcPath = "" } else { $Global:DstPath = ""; $Global:BtnDstNewF.Enabled = $true; $Global:BtnDstRef.Enabled = $true }
-                    Update-Directory $IsSource
-                }
+            $val = $sender.Text.Trim()
+            if (![string]::IsNullOrWhiteSpace($val) -and $val -notmatch "Type Bucket" -and $val -notmatch "--- Bucket ---") {
+                $locLbx.Enabled = $true
+                if ($IsSource) { $Global:SrcPath = "" } else { $Global:DstPath = ""; $Global:BtnDstNewF.Enabled = $true; $Global:BtnDstRef.Enabled = $true }
+                Update-Directory $IsSource
             }
         }
     })
-    Set-Variable -Name "Cmb${Prefix}Provider" -Value $CmbProv -Scope Global; Set-Variable -Name "Btn${Prefix}Auth" -Value $BtnAu -Scope Global; Set-Variable -Name "Btn${Prefix}SignOut" -Value $BtnOut -Scope Global; Set-Variable -Name "Lbl${Prefix}AuthStatus" -Value $LblStat -Scope Global; Set-Variable -Name "Cmb${Prefix}ProjList" -Value $CmbProj -Scope Global; Set-Variable -Name "Cmb${Prefix}BucList" -Value $CmbBuc -Scope Global; Set-Variable -Name "Btn${Prefix}Loc" -Value $BtnLoc -Scope Global; Set-Variable -Name "Lbl${Prefix}Path" -Value $LblPth -Scope Global; Set-Variable -Name "Lbx${Prefix}Dir" -Value $Lbx -Scope Global
+    Set-Variable -Name "Cmb${Prefix}Provider" -Value $CmbProv -Scope Global; Set-Variable -Name "Cmb${Prefix}AuthType" -Value $CmbAuth -Scope Global; Set-Variable -Name "Btn${Prefix}Auth" -Value $BtnAu -Scope Global; Set-Variable -Name "Btn${Prefix}SignOut" -Value $BtnOut -Scope Global; Set-Variable -Name "Lbl${Prefix}AuthStatus" -Value $LblStat -Scope Global; Set-Variable -Name "Cmb${Prefix}ProjList" -Value $CmbProj -Scope Global; Set-Variable -Name "Cmb${Prefix}BucList" -Value $CmbBuc -Scope Global; Set-Variable -Name "Btn${Prefix}Loc" -Value $BtnLoc -Scope Global; Set-Variable -Name "Lbl${Prefix}Path" -Value $LblPth -Scope Global; Set-Variable -Name "Lbx${Prefix}Dir" -Value $Lbx -Scope Global
 }
 
 Build-BrowserPanel $SplitBrowsers.Panel1 "Source Storage:" "Src"
@@ -400,7 +484,7 @@ $RtbLog = New-Object System.Windows.Forms.RichTextBox; $RtbLog.Dock = "Fill"; $R
 $PAction.BringToFront(); $PLogTop.BringToFront(); $RtbLog.BringToFront()
 
 # --- INITIALIZE UI STYLES ---
-$AllDropdowns = @($CmbSrcProvider, $CmbSrcProjList, $CmbSrcBucList, $CmbDstProvider, $CmbDstProjList, $CmbDstBucList, $CmbSort, $CmbSrcSort)
+$AllDropdowns = @($CmbSrcProvider, $CmbSrcAuthType, $CmbSrcProjList, $CmbSrcBucList, $CmbDstProvider, $CmbDstAuthType, $CmbDstProjList, $CmbDstBucList, $CmbSort, $CmbSrcSort)
 foreach ($cb in $AllDropdowns) { $cb.FlatStyle = "Flat" }
 
 function Update-Theme {
@@ -707,7 +791,7 @@ $BtnSrcFilter.Add_Click({ Show-FilterDialog })
 function Show-SettingsDialog {
     $SF = New-Object System.Windows.Forms.Form
     $SF.Text = "Configuration Settings"
-    $SF.Size = New-Object System.Drawing.Size(530, 430); $SF.StartPosition = "CenterParent"; $SF.FormBorderStyle = "FixedDialog"; $SF.MaximizeBox = $false; $SF.MinimizeBox = $false
+    $SF.Size = New-Object System.Drawing.Size(530, 530); $SF.StartPosition = "CenterParent"; $SF.FormBorderStyle = "FixedDialog"; $SF.MaximizeBox = $false; $SF.MinimizeBox = $false
     $SF.BackColor = $Form.BackColor; $SF.ForeColor = $Form.ForeColor
     
     $lblR = New-Object System.Windows.Forms.Label; $lblR.Text = "Rclone.exe Path:"; $lblR.Location = New-Object System.Drawing.Point(15, 20); $lblR.AutoSize = $true; $SF.Controls.Add($lblR)
@@ -726,37 +810,72 @@ function Show-SettingsDialog {
     $chkDebug.Size = New-Object System.Drawing.Size(485, 20)
     $chkDebug.Checked = $Global:AppSettings.IsDebugMode
     $SF.Controls.Add($chkDebug)
-
-    $lblT = New-Object System.Windows.Forms.Label; $lblT.Text = "Rclone Transfer Threads (1-6):"; $lblT.Location = New-Object System.Drawing.Point(15, 160); $lblT.AutoSize = $true; $SF.Controls.Add($lblT)
     
-    $cmbT = New-Object System.Windows.Forms.ComboBox; $cmbT.Location = New-Object System.Drawing.Point(200, 157); $cmbT.Size = New-Object System.Drawing.Size(50, 20); $cmbT.DropDownStyle = "DropDownList"; $cmbT.FlatStyle = "Flat"; [void]$cmbT.Items.AddRange(@(1,2,3,4,5,6)); $cmbT.SelectedItem = $Global:AppSettings.TransferThreads; $cmbT.BackColor = $TxtTaskName.BackColor; $cmbT.ForeColor = $TxtTaskName.ForeColor; $SF.Controls.Add($cmbT)
+    $chkForceRclone = New-Object System.Windows.Forms.CheckBox
+    $chkForceRclone.Text = "Force Rclone engine for Local <-> GCS transfers (Bypasses gcloud session limits)"
+    $chkForceRclone.Location = New-Object System.Drawing.Point(15, 155)
+    $chkForceRclone.Size = New-Object System.Drawing.Size(485, 20)
+    $chkForceRclone.Checked = $Global:AppSettings.ForceRcloneGcs
+    $SF.Controls.Add($chkForceRclone)
 
-    $lblTWarn = New-Object System.Windows.Forms.Label; $lblTWarn.Text = "Note: Using 4 or more threads on Google Drive may trigger 403 Rate Limit Quota Exceeded errors. 4+ threads are recommended for Local-to-Local transfers only."; $lblTWarn.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic); $lblTWarn.ForeColor = if ($Global:AppSettings.IsDarkMode) { [System.Drawing.Color]::LightCoral } else { [System.Drawing.Color]::IndianRed }; $lblTWarn.Location = New-Object System.Drawing.Point(15, 185); $lblTWarn.Size = New-Object System.Drawing.Size(485, 30); $SF.Controls.Add($lblTWarn)
+    $lblT = New-Object System.Windows.Forms.Label; $lblT.Text = "Rclone Transfer Threads (1-6):"; $lblT.Location = New-Object System.Drawing.Point(15, 185); $lblT.AutoSize = $true; $SF.Controls.Add($lblT)
+    
+    $cmbT = New-Object System.Windows.Forms.ComboBox; $cmbT.Location = New-Object System.Drawing.Point(200, 182); $cmbT.Size = New-Object System.Drawing.Size(50, 20); $cmbT.DropDownStyle = "DropDownList"; $cmbT.FlatStyle = "Flat"; [void]$cmbT.Items.AddRange(@(1,2,3,4,5,6)); $cmbT.SelectedItem = $Global:AppSettings.TransferThreads; $cmbT.BackColor = $TxtTaskName.BackColor; $cmbT.ForeColor = $TxtTaskName.ForeColor; $SF.Controls.Add($cmbT)
+
+    $lblTWarn = New-Object System.Windows.Forms.Label; $lblTWarn.Text = "Note: Using 4 or more threads on Google Drive may trigger 403 Rate Limit Quota Exceeded errors. 4+ threads are recommended for Local-to-Local transfers only."; $lblTWarn.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic); $lblTWarn.ForeColor = if ($Global:AppSettings.IsDarkMode) { [System.Drawing.Color]::LightCoral } else { [System.Drawing.Color]::IndianRed }; $lblTWarn.Location = New-Object System.Drawing.Point(15, 210); $lblTWarn.Size = New-Object System.Drawing.Size(485, 30); $SF.Controls.Add($lblTWarn)
+
+    # --- Google Cloud Storage Service Account section ---
+    $lblSASection = New-Object System.Windows.Forms.Label; $lblSASection.Text = "Google Cloud Storage - Service Account (Optional):"; $lblSASection.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold); $lblSASection.Location = New-Object System.Drawing.Point(15, 245); $lblSASection.AutoSize = $true; $SF.Controls.Add($lblSASection)
+
+    $lblSANote = New-Object System.Windows.Forms.Label
+    $lblSANote.Text = "Optional. Select a Service Account JSON key file to authenticate headless GCS transfers instead of interactive User OAuth."
+    $lblSANote.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+    $lblSANote.ForeColor = if ($Global:AppSettings.IsDarkMode) { [System.Drawing.Color]::LightGray } else { [System.Drawing.Color]::DimGray }
+    $lblSANote.Location = New-Object System.Drawing.Point(15, 265); $lblSANote.Size = New-Object System.Drawing.Size(485, 20); $SF.Controls.Add($lblSANote)
+
+    $lblSAKey = New-Object System.Windows.Forms.Label; $lblSAKey.Text = "JSON Key Path:"; $lblSAKey.Location = New-Object System.Drawing.Point(15, 290); $lblSAKey.AutoSize = $true; $SF.Controls.Add($lblSAKey)
+    $txtSAKey = New-Object System.Windows.Forms.TextBox; $txtSAKey.Location = New-Object System.Drawing.Point(120, 287); $txtSAKey.Size = New-Object System.Drawing.Size(240, 20); $txtSAKey.Text = $Global:AppSettings.GcsServiceAccountKeyPath; $txtSAKey.BackColor = $TxtTaskName.BackColor; $txtSAKey.ForeColor = $TxtTaskName.ForeColor; $txtSAKey.BorderStyle = "FixedSingle"; $SF.Controls.Add($txtSAKey)
+    $btnBrowseSA = New-Object System.Windows.Forms.Button; $btnBrowseSA.Text = "Browse"; $btnBrowseSA.Location = New-Object System.Drawing.Point(365, 285); $btnBrowseSA.Size = New-Object System.Drawing.Size(65, 24); $btnBrowseSA.FlatStyle="Flat"; $btnBrowseSA.FlatAppearance.BorderSize=1; $btnBrowseSA.FlatAppearance.BorderColor=[System.Drawing.Color]::Gray; $btnBrowseSA.BackColor = $BtnSettings.BackColor; $btnBrowseSA.ForeColor = $BtnSettings.ForeColor; $SF.Controls.Add($btnBrowseSA)
+    $btnClearSA = New-Object System.Windows.Forms.Button; $btnClearSA.Text = "Clear"; $btnClearSA.Location = New-Object System.Drawing.Point(435, 285); $btnClearSA.Size = New-Object System.Drawing.Size(55, 24); $btnClearSA.FlatStyle="Flat"; $btnClearSA.FlatAppearance.BorderSize=1; $btnClearSA.FlatAppearance.BorderColor=[System.Drawing.Color]::Gray; $btnClearSA.BackColor = $BtnSettings.BackColor; $btnClearSA.ForeColor = $BtnSettings.ForeColor; $SF.Controls.Add($btnClearSA)
 
     # --- Google Drive API credentials section ---
-    $lblDivider = New-Object System.Windows.Forms.Label; $lblDivider.Text = "Google Drive API - Custom OAuth Client (Optional):"; $lblDivider.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold); $lblDivider.Location = New-Object System.Drawing.Point(15, 225); $lblDivider.AutoSize = $true; $SF.Controls.Add($lblDivider)
+    $lblDivider = New-Object System.Windows.Forms.Label; $lblDivider.Text = "Google Drive API - Custom OAuth Client (Optional):"; $lblDivider.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold); $lblDivider.Location = New-Object System.Drawing.Point(15, 320); $lblDivider.AutoSize = $true; $SF.Controls.Add($lblDivider)
 
     $lblDriveNote = New-Object System.Windows.Forms.Label
-    $lblDriveNote.Text = "Optional. Leave blank to use rclone's shared built-in credentials. To use a custom Client ID: enter the values below, click Save & Apply, then click Login/Auth to re-authenticate. No manual Sign Out step is required. See: rclone.org/drive/#making-your-own-client-id"
+    $lblDriveNote.Text = "Optional. Leave blank to use rclone's shared built-in credentials. To use a custom Client ID: enter values, click Save & Apply, then click Login/Auth to re-authenticate."
     $lblDriveNote.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
     $lblDriveNote.ForeColor = if ($Global:AppSettings.IsDarkMode) { [System.Drawing.Color]::LightGray } else { [System.Drawing.Color]::DimGray }
-    $lblDriveNote.Location = New-Object System.Drawing.Point(15, 245); $lblDriveNote.Size = New-Object System.Drawing.Size(485, 30); $SF.Controls.Add($lblDriveNote)
+    $lblDriveNote.Location = New-Object System.Drawing.Point(15, 340); $lblDriveNote.Size = New-Object System.Drawing.Size(485, 20); $SF.Controls.Add($lblDriveNote)
 
-    $lblCId = New-Object System.Windows.Forms.Label; $lblCId.Text = "Client ID:"; $lblCId.Location = New-Object System.Drawing.Point(15, 280); $lblCId.AutoSize = $true; $SF.Controls.Add($lblCId)
-    $txtCId = New-Object System.Windows.Forms.TextBox; $txtCId.Location = New-Object System.Drawing.Point(120, 277); $txtCId.Size = New-Object System.Drawing.Size(390, 20); $txtCId.Text = $Global:AppSettings.DriveClientId; $txtCId.BackColor = $TxtTaskName.BackColor; $txtCId.ForeColor = $TxtTaskName.ForeColor; $txtCId.BorderStyle = "FixedSingle"; $SF.Controls.Add($txtCId)
+    $lblCId = New-Object System.Windows.Forms.Label; $lblCId.Text = "Client ID:"; $lblCId.Location = New-Object System.Drawing.Point(15, 365); $lblCId.AutoSize = $true; $SF.Controls.Add($lblCId)
+    $txtCId = New-Object System.Windows.Forms.TextBox; $txtCId.Location = New-Object System.Drawing.Point(120, 362); $txtCId.Size = New-Object System.Drawing.Size(370, 20); $txtCId.Text = $Global:AppSettings.DriveClientId; $txtCId.BackColor = $TxtTaskName.BackColor; $txtCId.ForeColor = $TxtTaskName.ForeColor; $txtCId.BorderStyle = "FixedSingle"; $SF.Controls.Add($txtCId)
 
-    $lblCSec = New-Object System.Windows.Forms.Label; $lblCSec.Text = "Client Secret:"; $lblCSec.Location = New-Object System.Drawing.Point(15, 308); $lblCSec.AutoSize = $true; $SF.Controls.Add($lblCSec)
-    $txtCSec = New-Object System.Windows.Forms.TextBox; $txtCSec.Location = New-Object System.Drawing.Point(120, 305); $txtCSec.Size = New-Object System.Drawing.Size(390, 20); $txtCSec.Text = $Global:AppSettings.DriveClientSecret; $txtCSec.BackColor = $TxtTaskName.BackColor; $txtCSec.ForeColor = $TxtTaskName.ForeColor; $txtCSec.BorderStyle = "FixedSingle"; $txtCSec.UseSystemPasswordChar = $true; $SF.Controls.Add($txtCSec)
+    $lblCSec = New-Object System.Windows.Forms.Label; $lblCSec.Text = "Client Secret:"; $lblCSec.Location = New-Object System.Drawing.Point(15, 393); $lblCSec.AutoSize = $true; $SF.Controls.Add($lblCSec)
+    $txtCSec = New-Object System.Windows.Forms.TextBox; $txtCSec.Location = New-Object System.Drawing.Point(120, 390); $txtCSec.Size = New-Object System.Drawing.Size(370, 20); $txtCSec.Text = $Global:AppSettings.DriveClientSecret; $txtCSec.BackColor = $TxtTaskName.BackColor; $txtCSec.ForeColor = $TxtTaskName.ForeColor; $txtCSec.BorderStyle = "FixedSingle"; $txtCSec.UseSystemPasswordChar = $true; $SF.Controls.Add($txtCSec)
 
-    $chkShowSec = New-Object System.Windows.Forms.CheckBox; $chkShowSec.Text = "Show Secret"; $chkShowSec.Location = New-Object System.Drawing.Point(15, 330); $chkShowSec.AutoSize = $true; $chkShowSec.ForeColor = if ($Global:AppSettings.IsDarkMode) { [System.Drawing.Color]::LightGray } else { [System.Drawing.Color]::DimGray }; $SF.Controls.Add($chkShowSec)
+    $chkShowSec = New-Object System.Windows.Forms.CheckBox; $chkShowSec.Text = "Show Secret"; $chkShowSec.Location = New-Object System.Drawing.Point(120, 415); $chkShowSec.AutoSize = $true; $chkShowSec.ForeColor = if ($Global:AppSettings.IsDarkMode) { [System.Drawing.Color]::LightGray } else { [System.Drawing.Color]::DimGray }; $SF.Controls.Add($chkShowSec)
     $chkShowSec.Add_CheckedChanged({ $txtCSec.UseSystemPasswordChar = -not $chkShowSec.Checked })
 
-    $btnSave = New-Object System.Windows.Forms.Button; $btnSave.Text = "Save & Apply"; $btnSave.Location = New-Object System.Drawing.Point(120, 360); $btnSave.Size = New-Object System.Drawing.Size(120, 30); $btnSave.FlatStyle="Flat"; $btnSave.FlatAppearance.BorderSize=1; $btnSave.FlatAppearance.BorderColor=[System.Drawing.Color]::Gray; $btnSave.BackColor = $BtnSettings.BackColor; $btnSave.ForeColor = $BtnSettings.ForeColor; $SF.Controls.Add($btnSave)
+    $btnSave = New-Object System.Windows.Forms.Button; $btnSave.Text = "Save & Apply"; $btnSave.Location = New-Object System.Drawing.Point(120, 445); $btnSave.Size = New-Object System.Drawing.Size(120, 30); $btnSave.FlatStyle="Flat"; $btnSave.FlatAppearance.BorderSize=1; $btnSave.FlatAppearance.BorderColor=[System.Drawing.Color]::Gray; $btnSave.BackColor = $BtnSettings.BackColor; $btnSave.ForeColor = $BtnSettings.ForeColor; $SF.Controls.Add($btnSave)
     
-    $btnHelp = New-Object System.Windows.Forms.Button; $btnHelp.Text = "Help / Guide"; $btnHelp.Location = New-Object System.Drawing.Point(260, 360); $btnHelp.Size = New-Object System.Drawing.Size(120, 30); $btnHelp.FlatStyle="Flat"; $btnHelp.FlatAppearance.BorderSize=1; $btnHelp.FlatAppearance.BorderColor=[System.Drawing.Color]::Gray; $btnHelp.BackColor = $BtnSettings.BackColor; $btnHelp.ForeColor = $BtnSettings.ForeColor; $SF.Controls.Add($btnHelp)
+    $btnHelp = New-Object System.Windows.Forms.Button; $btnHelp.Text = "Help / Guide"; $btnHelp.Location = New-Object System.Drawing.Point(260, 445); $btnHelp.Size = New-Object System.Drawing.Size(120, 30); $btnHelp.FlatStyle="Flat"; $btnHelp.FlatAppearance.BorderSize=1; $btnHelp.FlatAppearance.BorderColor=[System.Drawing.Color]::Gray; $btnHelp.BackColor = $BtnSettings.BackColor; $btnHelp.ForeColor = $BtnSettings.ForeColor; $SF.Controls.Add($btnHelp)
     
     $btnBR.Add_Click({ $fd = New-Object System.Windows.Forms.OpenFileDialog; $fd.Filter = "Executable (*.exe)|*.exe"; if ($fd.ShowDialog() -eq "OK") { $txtR.Text = $fd.FileName } })
     $btnBG.Add_Click({ $fb = New-Object System.Windows.Forms.FolderBrowserDialog; if ($fb.ShowDialog() -eq "OK") { $txtG.Text = $fb.SelectedPath } })
+    $btnBrowseSA.Add_Click({ 
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Filter = "JSON Key Files (*.json)|*.json|All Files (*.*)|*.*"
+        $ofd.Title = "Select Google Cloud Service Account JSON Key"
+        if ($ofd.ShowDialog() -eq "OK") {
+            $info = Get-GcsServiceAccountInfo $ofd.FileName
+            if ($info) {
+                $txtSAKey.Text = $ofd.FileName
+            } else {
+                [System.Windows.Forms.MessageBox]::Show("The selected file is not a valid Google Cloud Service Account JSON key.", "Invalid Key File", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+            }
+        }
+    })
+    $btnClearSA.Add_Click({ $txtSAKey.Text = "" })
     $btnHelp.Add_Click({ [System.Diagnostics.Process]::Start("https://docs.google.com/document/d/1Hm5I8qBpaZQ3gEyMJzXjGdOEZCYV5gNFaeLhKkFZ-u8/edit?usp=sharing") | Out-Null })
     $btnSave.Add_Click({ 
         $Global:AppSettings.RclonePath = $txtR.Text
@@ -765,6 +884,21 @@ function Show-SettingsDialog {
         $Global:AppSettings.TransferThreads = $cmbT.SelectedItem
         $Global:AppSettings.DriveClientId = $txtCId.Text.Trim()
         $Global:AppSettings.DriveClientSecret = $txtCSec.Text.Trim()
+        $Global:AppSettings.ForceRcloneGcs = $chkForceRclone.Checked
+        
+        $newSaKey = $txtSAKey.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($newSaKey)) {
+            if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount") {
+                Revoke-GcsServiceAccount
+            }
+            $Global:AppSettings.GcsServiceAccountKeyPath = ""
+        } else {
+            if (Test-Path -LiteralPath $newSaKey) {
+                $Global:AppSettings.GcsServiceAccountKeyPath = $newSaKey
+                Activate-GcsServiceAccount $newSaKey | Out-Null
+            }
+        }
+        
         Save-Settings; Set-RcloneEnvironment; Set-GCloudEnvironment
         [System.Windows.Forms.MessageBox]::Show("Settings saved.", "Settings Saved") | Out-Null; $SF.Close() 
     })
@@ -775,6 +909,36 @@ function Show-SettingsDialog {
 function Get-CloudItems([string]$Prov, [string]$Buc, [string]$Pth, [bool]$DirOnly, [bool]$IsSrc) {
     $parsed = New-Object System.Collections.ArrayList; $seen = @{}
     if ($Prov -eq "GCS") {
+        # 1. Primary engine: Rclone lsjson via GCSBridge (direct bucket-level JSON API access, works for Service Accounts and OAuth)
+        if ($Global:RcloneExe -and (Test-Path -LiteralPath $Global:TempConfig)) {
+            $trimmedPth = $Pth.Trim('/')
+            $target = if ([string]::IsNullOrWhiteSpace($trimmedPth)) { "${Global:GcsBridgeName}:${Buc}" } else { "${Global:GcsBridgeName}:${Buc}/${trimmedPth}" }
+            $args = "lsjson `"$target`" --config `"$Global:TempConfig`""
+            $result = Execute-Cli-Json -cmdArgs $args -isRclone $true
+            if ($result) {
+                $rArray = if ($result -is [array]) { $result } else { @($result) }
+                foreach ($i in $rArray) {
+                    $rawDate = if ($i.ModTime) { try { [DateTime]::Parse($i.ModTime) } catch { [DateTime]::MinValue } } else { [DateTime]::MinValue }
+                    if ($i.IsDir) {
+                        $leaf = "$($i.Name)/"
+                        if (-not $seen[$leaf]) {
+                            $seen[$leaf] = $true
+                            [void]$parsed.Add((New-BrowserListItem -Type 0 -Name $leaf -RawDate $rawDate))
+                        }
+                    } else {
+                        if (-not $DirOnly) {
+                            $leaf = $i.Name
+                            if ($leaf -ne ".placeholder" -and -not [string]::IsNullOrWhiteSpace($leaf) -and -not $seen[$leaf]) {
+                                $seen[$leaf] = $true
+                                [void]$parsed.Add((New-BrowserListItem -Type 1 -Name $leaf -RawDate $rawDate))
+                            }
+                        }
+                    }
+                }
+                return $parsed
+            }
+        }
+
         function Normalize-GcsCandidatePath([string]$LineValue) {
             $line = if ($LineValue) { $LineValue.Trim() } else { "" }
             if ([string]::IsNullOrWhiteSpace($line)) { return "" }
@@ -1274,6 +1438,14 @@ function Invoke-GlobalSignOut {
     param([string]$Provider)
 
     if ($Provider -eq "GCS") {
+        if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount") {
+            $confirm = [System.Windows.Forms.MessageBox]::Show("Clear active Google Cloud Service Account credentials?", "Clear Service Account", "YesNo", "Question")
+            if ($confirm -eq "Yes") {
+                Revoke-GcsServiceAccount
+                [System.Windows.Forms.MessageBox]::Show("Service Account credentials cleared.", "Cleared") | Out-Null
+            }
+            return
+        }
         $confirm = [System.Windows.Forms.MessageBox]::Show("Sign out of Google Cloud Storage? This will wipe your credentials globally so you can switch accounts.", "Sign Out GCS", "YesNo", "Warning")
         if ($confirm -eq "Yes") {
             $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
@@ -1353,43 +1525,103 @@ function Handle-SignOutClick([bool]$IsSrc) {
     Handle-ProviderChange $IsSrc
 }
 
+function Handle-AuthTypeChange([bool]$IsSrc) {
+    $CmbAuth = if($IsSrc){$CmbSrcAuthType}else{$CmbDstAuthType}
+    $OtherCmbAuth = if($IsSrc){$CmbDstAuthType}else{$CmbSrcAuthType}
+    if ($CmbAuth.SelectedIndex -eq 0) {
+        $Global:AppSettings.GcsAuthType = "UserOAuth"
+    } else {
+        $Global:AppSettings.GcsAuthType = "ServiceAccount"
+    }
+    if ($OtherCmbAuth.SelectedIndex -ne $CmbAuth.SelectedIndex) {
+        $OtherCmbAuth.SelectedIndex = $CmbAuth.SelectedIndex
+    }
+    Save-Settings
+    Set-RcloneEnvironment
+    Set-GCloudEnvironment
+    Handle-ProviderChange $IsSrc
+}
+$CmbSrcAuthType.Add_SelectedIndexChanged({ Handle-AuthTypeChange $true })
+$CmbDstAuthType.Add_SelectedIndexChanged({ Handle-AuthTypeChange $false })
+
 function Handle-AuthClick([bool]$IsSrc) {
     $Prov = if($IsSrc){$Global:SrcProvider}else{$Global:DstProvider}
     $ProvCmb = if($IsSrc){$CmbSrcProvider}else{$CmbDstProvider}
     
     if ($Prov -eq "GCS") {
-        $gcmd = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
-        try {
-            $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-            $pInfo = New-Object System.Diagnostics.ProcessStartInfo
-            $pInfo.FileName = "cmd.exe"
-            $pInfo.Arguments = "/c `"`"$gcmd`" auth login`""
-            $pInfo.UseShellExecute = $false
-            $pInfo.CreateNoWindow = $false
-            $p = [System.Diagnostics.Process]::Start($pInfo)
-            $p.WaitForExit()
-            
-            if ($p.ExitCode -eq 0) { 
-                # TEMPORARILY REMOVE ENV VAR TO PREVENT (Y/n) PROMPT IN THE BACKGROUND
-                $backupEnv = $env:GOOGLE_APPLICATION_CREDENTIALS
-                $env:GOOGLE_APPLICATION_CREDENTIALS = ""
-
-                $pInfo2 = New-Object System.Diagnostics.ProcessStartInfo
-                $pInfo2.FileName = "cmd.exe"
-                $pInfo2.Arguments = "/c `"`"$gcmd`" auth application-default login`""
-                $pInfo2.UseShellExecute = $false
-                $pInfo2.CreateNoWindow = $false
-                $p2 = [System.Diagnostics.Process]::Start($pInfo2)
-                $p2.WaitForExit()
-                
-                # Restore Env Var
-                if ($backupEnv) { $env:GOOGLE_APPLICATION_CREDENTIALS = $backupEnv }
-                Set-GCloudEnvironment
-
-                $ProvCmb.SelectedIndex = 0; $ProvCmb.SelectedIndex = 1 
+        if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount") {
+            $ofd = New-Object System.Windows.Forms.OpenFileDialog
+            $ofd.Filter = "JSON Key Files (*.json)|*.json|All Files (*.*)|*.*"
+            $ofd.Title = "Select Google Cloud Service Account JSON Key"
+            if ($ofd.ShowDialog() -eq "OK") {
+                $info = Get-GcsServiceAccountInfo $ofd.FileName
+                if ($info) {
+                    $activated = Activate-GcsServiceAccount $ofd.FileName
+                    if ($activated) {
+                        Handle-ProviderChange $IsSrc
+                    } else {
+                        [System.Windows.Forms.MessageBox]::Show("Failed to activate Google Cloud Service Account via gcloud.", "Activation Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+                    }
+                } else {
+                    [System.Windows.Forms.MessageBox]::Show("The selected file is not a valid Google Cloud Service Account JSON key.", "Invalid Key File", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+                }
             }
-        } catch {} finally {
-            $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+            return
+        }
+
+        if ($Global:AppSettings.ForceRcloneGcs -and $Global:AppSettings.GcsAuthType -eq "UserOAuth") {
+            try {
+                $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+                try {
+                    $pDel = New-Object System.Diagnostics.ProcessStartInfo
+                    $pDel.FileName = $Global:RcloneExe
+                    $pDel.Arguments = "config delete `"$Global:GcsBridgeName`" --config `"$Global:TempConfig`""
+                    $pDel.UseShellExecute = $false; $pDel.CreateNoWindow = $true
+                    [System.Diagnostics.Process]::Start($pDel).WaitForExit()
+                } catch {}
+
+                $authArgs = "config create `"$Global:GcsBridgeName`" `"google cloud storage`" env_auth=false bucket_policy_only=true --config `"$Global:TempConfig`""
+                $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $pInfo.FileName = $Global:RcloneExe
+                $pInfo.Arguments = $authArgs
+                $pInfo.UseShellExecute = $false; $pInfo.CreateNoWindow = $false
+                $p = [System.Diagnostics.Process]::Start($pInfo)
+                $p.WaitForExit()
+
+                if ($p.ExitCode -eq 0) { $ProvCmb.SelectedIndex = 0; $ProvCmb.SelectedIndex = 1 }
+            } catch {} finally {
+                $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+            }
+        } else {
+            $gcmd = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+            try {
+                $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+                $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $pInfo.FileName = "cmd.exe"
+                $pInfo.Arguments = "/c `"`"$gcmd`" auth login`""
+                $pInfo.UseShellExecute = $false
+                $pInfo.CreateNoWindow = $false
+                $p = [System.Diagnostics.Process]::Start($pInfo)
+                $p.WaitForExit()
+                
+                if ($p.ExitCode -eq 0) { 
+                    $backupEnv = $env:GOOGLE_APPLICATION_CREDENTIALS
+                    $env:GOOGLE_APPLICATION_CREDENTIALS = ""
+                    $pInfo2 = New-Object System.Diagnostics.ProcessStartInfo
+                    $pInfo2.FileName = "cmd.exe"
+                    $pInfo2.Arguments = "/c `"`"$gcmd`" auth application-default login`""
+                    $pInfo2.UseShellExecute = $false
+                    $pInfo2.CreateNoWindow = $false
+                    $p2 = [System.Diagnostics.Process]::Start($pInfo2)
+                    $p2.WaitForExit()
+                    
+                    if ($backupEnv) { $env:GOOGLE_APPLICATION_CREDENTIALS = $backupEnv }
+                    Set-GCloudEnvironment
+                    $ProvCmb.SelectedIndex = 0; $ProvCmb.SelectedIndex = 1 
+                }
+            } catch {} finally {
+                $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+            }
         }
     } else {
         $driveExtraArgs = ""
@@ -1444,14 +1676,35 @@ function Handle-ProviderChange([bool]$IsSrc) {
     $ProvCmb = if($IsSrc){$CmbSrcProvider}else{$CmbDstProvider}; $ProvList = @("", "GCS", "GDRIVE", "LOCAL"); $Prov = $ProvList[$ProvCmb.SelectedIndex]
     if($IsSrc){$Global:SrcProvider=$Prov; $Global:SrcPath=""; $Global:SrcIsFile=$false}else{$Global:DstProvider=$Prov; $Global:DstPath=""}
     
+    $CmbAuth = if($IsSrc){$CmbSrcAuthType}else{$CmbDstAuthType}
     $BtnAuth = if($IsSrc){$BtnSrcAuth}else{$BtnDstAuth}; $LblStat = if($IsSrc){$LblSrcAuthStatus}else{$LblDstAuthStatus}
     $BtnSignOut = if($IsSrc){$BtnSrcSignOut}else{$BtnDstSignOut}
     $CmbProj = if($IsSrc){$CmbSrcProjList}else{$CmbDstProjList}; $CmbBuc = if($IsSrc){$CmbSrcBucList}else{$CmbDstBucList}
     $BtnLoc = if($IsSrc){$BtnSrcLoc}else{$BtnDstLoc}; $Lbx = if($IsSrc){$LbxSrcDir}else{$LbxDstDir}
     
     $Lbx.Items.Clear(); $Lbx.Enabled = $false; $BtnUpload.Enabled = $false
-    $CmbProj.Visible=($Prov -eq "GCS" -or $Prov -eq "GDRIVE"); 
     
+    $CmbAuth.Visible = ($Prov -eq "GCS")
+    if ($Prov -eq "GCS") {
+        $CmbAuth.SelectedIndex = if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount") { 1 } else { 0 }
+        $BtnAuth.Location = New-Object System.Drawing.Point(170, 64)
+        $BtnAuth.Size = New-Object System.Drawing.Size(85, 25)
+        $BtnSignOut.Location = New-Object System.Drawing.Point(170, 64)
+        $BtnSignOut.Size = New-Object System.Drawing.Size(85, 25)
+        $LblStat.Location = New-Object System.Drawing.Point(260, 68)
+        $BtnAuth.Text = if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount") { "Select Key" } else { "Login/Auth" }
+        $BtnSignOut.Text = if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount") { "Clear Key" } else { "Sign Out" }
+    } else {
+        $BtnAuth.Location = New-Object System.Drawing.Point(5, 64)
+        $BtnAuth.Size = New-Object System.Drawing.Size(95, 25)
+        $BtnSignOut.Location = New-Object System.Drawing.Point(105, 64)
+        $BtnSignOut.Size = New-Object System.Drawing.Size(85, 25)
+        $LblStat.Location = New-Object System.Drawing.Point(195, 68)
+        $BtnAuth.Text = "Login/Auth"
+        $BtnSignOut.Text = "Sign Out"
+    }
+
+    $CmbProj.Visible=($Prov -eq "GCS" -or $Prov -eq "GDRIVE"); 
     $CmbBuc.Visible=($Prov -eq "GCS") 
     $BtnLoc.Visible=($Prov -eq "LOCAL")
     
@@ -1474,7 +1727,12 @@ function Handle-ProviderChange([bool]$IsSrc) {
     } 
 
     if ($Global:LoadingHistory) {
-        if ($Prov -eq "GCS") { $LblStat.Text = "Auth (GCS)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }; $BtnSignOut.Enabled = $true; $BtnAuth.Enabled = $false }
+        if ($Prov -eq "GCS") { 
+            $LblStat.Text = if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount") { "Auth (SA)" } else { "Auth (GCS)" }
+            $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }
+            $BtnSignOut.Enabled = $true
+            $BtnAuth.Enabled = $false 
+        }
         elseif ($Prov -eq "GDRIVE") { $LblStat.Text = Get-DriveAuthLabel; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }; $BtnSignOut.Enabled = $true; $BtnAuth.Enabled = $false }
         elseif ($Prov -eq "LOCAL") { $LblStat.Text = "Local Active"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" } }
         $Lbx.Enabled = $true
@@ -1489,26 +1747,71 @@ function Handle-ProviderChange([bool]$IsSrc) {
     } else {
         $BtnAuth.Enabled = $false; $LblStat.Text = "Checking..."; $LblStat.ForeColor = "Orange"; [System.Windows.Forms.Application]::DoEvents()
         if ($Prov -eq "GCS") {
-            try { $data = Execute-Cli-Json -cmdArgs "projects list --format=json" -isRclone $false } catch { $data = $null }
+            if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount") {
+                $saKey = $Global:AppSettings.GcsServiceAccountKeyPath
+                $saInfo = Get-GcsServiceAccountInfo $saKey
+                if ($saInfo -and (Test-Path -LiteralPath $saKey)) {
+                    $shortEmail = if ($saInfo.client_email.Length -gt 18) { $saInfo.client_email.Substring(0, 15) + "..." } else { $saInfo.client_email }
+                    $LblStat.Text = "Auth (SA: $shortEmail)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }
+                    $BtnSignOut.Visible = $true
+                    $BtnSignOut.Enabled = $true
+                    $BtnAuth.Visible = $false
+                    $CmbProj.Items.Clear()
+                    if ($saInfo.project_id) {
+                        [void]$CmbProj.Items.Add($saInfo.project_id)
+                    } else {
+                        [void]$CmbProj.Items.Add("[ No Project ID (Manual) ]")
+                    }
+                    $CmbProj.Enabled = $true; $CmbProj.SelectedIndex = 0
+                    if (-not $IsSrc -and -not $Global:LoadingHistory) { $BtnDstRef.Enabled = $true }
+                } else {
+                    $LblStat.Text = "Key Required"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightCoral" } else { "Red" }
+                    $BtnSignOut.Visible = $false
+                    $BtnAuth.Visible = $true
+                    $BtnAuth.Enabled = $true
+                    $CmbProj.Items.Clear(); [void]$CmbProj.Items.Add("[ No Project ID (Manual) ]")
+                    $CmbProj.Enabled = $true; $CmbProj.SelectedIndex = 0
+                }
+            } else {
+            $BtnSignOut.Visible = $true
+            $BtnAuth.Visible = $true
             
-            if ($data) { 
-                $LblStat.Text = "Auth (GCS)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }
-                $BtnSignOut.Enabled = $true
-                $BtnAuth.Enabled = $false
-                $CmbProj.Items.Clear(); [void]$CmbProj.Items.Add("--- Project ---"); [void]$CmbProj.Items.Add("[ No Project ID (Manual) ]")
-                
-                $dArray = if ($data -is [array]) { $data } else { @($data) }
-                $dArray | Select-Object -ExpandProperty projectId -ErrorAction SilentlyContinue | ForEach-Object { [void]$CmbProj.Items.Add($_) }
-                
-                $CmbProj.Enabled = $true; $CmbProj.SelectedIndex = 0 
-                if (-not $IsSrc -and -not $Global:LoadingHistory) { $BtnDstRef.Enabled = $true } 
-            } else { 
-                $LblStat.Text = "Not Connected"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightCoral" } else { "Red" }
-                $BtnSignOut.Enabled = $false
-                $BtnAuth.Enabled = $true
-                $CmbProj.Items.Clear(); [void]$CmbProj.Items.Add("[ No Project ID (Manual) ]")
-                $CmbProj.Enabled = $true; $CmbProj.SelectedIndex = 0 
+            if ($Global:AppSettings.ForceRcloneGcs) {
+                $cfgData = Get-Content -LiteralPath $Global:TempConfig -Raw -ErrorAction SilentlyContinue
+                if ($cfgData -and $cfgData -match "(?ms)\[$([regex]::Escape($Global:GcsBridgeName))\].*?token\s*=") {
+                    $LblStat.Text = "Auth (Rclone OAuth)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }
+                    $BtnSignOut.Enabled = $true; $BtnAuth.Enabled = $false
+                    $CmbProj.Items.Clear(); [void]$CmbProj.Items.Add("[ No Project ID (Manual) ]")
+                    $CmbProj.Enabled = $true; $CmbProj.SelectedIndex = 0 
+                    if (-not $IsSrc -and -not $Global:LoadingHistory) { $BtnDstRef.Enabled = $true } 
+                } else {
+                    $LblStat.Text = "Not Connected"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightCoral" } else { "Red" }
+                    $BtnSignOut.Enabled = $false; $BtnAuth.Enabled = $true
+                    $CmbProj.Items.Clear(); [void]$CmbProj.Items.Add("[ No Project ID (Manual) ]")
+                    $CmbProj.Enabled = $true; $CmbProj.SelectedIndex = 0 
+                }
+            } else {
+                try { $data = Execute-Cli-Json -cmdArgs "projects list --format=json" -isRclone $false } catch { $data = $null }
+                if ($data) { 
+                    $LblStat.Text = "Auth (GCS)"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }
+                    $BtnSignOut.Enabled = $true
+                    $BtnAuth.Enabled = $false
+                    $CmbProj.Items.Clear(); [void]$CmbProj.Items.Add("--- Project ---"); [void]$CmbProj.Items.Add("[ No Project ID (Manual) ]")
+                    
+                    $dArray = if ($data -is [array]) { $data } else { @($data) }
+                    $dArray | Select-Object -ExpandProperty projectId -ErrorAction SilentlyContinue | ForEach-Object { [void]$CmbProj.Items.Add($_) }
+                    
+                    $CmbProj.Enabled = $true; $CmbProj.SelectedIndex = 0 
+                    if (-not $IsSrc -and -not $Global:LoadingHistory) { $BtnDstRef.Enabled = $true } 
+                } else { 
+                    $LblStat.Text = "Not Connected"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightCoral" } else { "Red" }
+                    $BtnSignOut.Enabled = $false
+                    $BtnAuth.Enabled = $true
+                    $CmbProj.Items.Clear(); [void]$CmbProj.Items.Add("[ No Project ID (Manual) ]")
+                    $CmbProj.Enabled = $true; $CmbProj.SelectedIndex = 0 
+                }
             }
+        }
         } elseif ($Prov -eq "GDRIVE") {
             try { $d = Execute-Cli-Json -cmdArgs "about `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --json" -isRclone $true } catch { $d = $null }
             if ($d) { 
@@ -1535,48 +1838,12 @@ function Handle-ProjChange([bool]$IsSrc) {
     $CmbProj = if($IsSrc){$CmbSrcProjList}else{$CmbDstProjList}; $CmbBuc = if($IsSrc){$CmbSrcBucList}else{$CmbDstBucList}
     
     if($Prov -eq "GCS") {
-        if ($CmbProj.SelectedItem -eq "[ No Project ID (Manual) ]") {
-            $CmbBuc.DropDownStyle = "DropDown"
-            $CmbBuc.Items.Clear()
-            $CmbBuc.Text = "Type Bucket & Press Enter..."
-            $CmbBuc.Enabled = $true
-            $CmbBuc.Visible = $true
-        } elseif ($CmbProj.SelectedIndex -gt 0) {
-            $CmbBuc.DropDownStyle = "DropDownList"
-            
-            $projArg = Get-GcsProjectArg $CmbProj.SelectedItem
-            
-            try { $buckets = Execute-Cli-Json -cmdArgs (("storage buckets list {0} --format=json" -f $projArg).Trim()) -isRclone $false } catch { $buckets = $null }
-            $CmbBuc.Items.Clear(); [void]$CmbBuc.Items.Add("--- Bucket ---")
-            if ($buckets) { 
-                $bArray = if ($buckets -is [array]) { $buckets } else { @($buckets) }
-                $bArray | Select-Object -ExpandProperty name -ErrorAction SilentlyContinue | ForEach-Object{ [void]$CmbBuc.Items.Add($_) } 
-            } else {
-                $bucketText = Execute-Cli-Text -cmdArgs (("storage buckets list {0}" -f $projArg).Trim()) -isRclone $false
-                if (-not [string]::IsNullOrWhiteSpace($bucketText)) {
-                    foreach ($line in ($bucketText -split "`r?`n")) {
-                        $bucketName = $line.Trim() -replace '^gs://', '' -replace '/$', ''
-                        if (-not [string]::IsNullOrWhiteSpace($bucketName) -and $bucketName -notmatch '^NAME\s*$') {
-                            [void]$CmbBuc.Items.Add($bucketName)
-                        }
-                    }
-                }
-
-                if ($CmbBuc.Items.Count -le 1) {
-                    $gsBuckets = Execute-Gsutil-Result -cmdArgs "ls"
-                    if (-not [string]::IsNullOrWhiteSpace($gsBuckets.Output)) {
-                        foreach ($line in ($gsBuckets.Output -split "`r?`n")) {
-                            $bucketName = $line.Trim() -replace '^gs://', '' -replace '/$', ''
-                            if (-not [string]::IsNullOrWhiteSpace($bucketName) -and -not $CmbBuc.Items.Contains($bucketName)) {
-                                [void]$CmbBuc.Items.Add($bucketName)
-                            }
-                        }
-                    }
-                }
-            }
-            $CmbBuc.Enabled = $true; $CmbBuc.SelectedIndex = 0
-            $CmbBuc.Visible = $true
-        }
+        # Force manual entry for all GCS buckets
+        $CmbBuc.DropDownStyle = "DropDown"
+        $CmbBuc.Items.Clear()
+        $CmbBuc.Text = "Type Bucket & Press Enter..."
+        $CmbBuc.Enabled = $true
+        $CmbBuc.Visible = $true
     } elseif ($Prov -eq "GDRIVE") {
         $CmbBuc.DropDownStyle = "DropDownList"
         if($IsSrc){$Global:SrcPath=""}else{$Global:DstPath=""}
@@ -1585,7 +1852,9 @@ function Handle-ProjChange([bool]$IsSrc) {
             $CmbBuc.Items.Clear()
             if ($d) { 
                 $dArray = if ($d -is [array]) { $d } else { @($d) }
-                foreach($i in $dArray){ [void]$CmbBuc.Items.Add($i.name); $Global:DriveMap[$i.name]=$i.id }; $CmbBuc.Enabled = $true; $CmbBuc.Visible = $true; if($CmbBuc.Items.Count -gt 0){ $CmbBuc.SelectedIndex = 0 } 
+                foreach($i in $dArray){ [void]$CmbBuc.Items.Add($i.name); $Global:DriveMap[$i.name]=$i.id }
+                $CmbBuc.Enabled = $true; $CmbBuc.Visible = $true
+                if($CmbBuc.Items.Count -gt 0){ $CmbBuc.SelectedIndex = 0 } 
             }
         } else { 
             $CmbBuc.Items.Clear()
@@ -1654,15 +1923,22 @@ $BtnDstNewF.Add_Click({
     if ($Global:DstProvider -eq "LOCAL" -and $Global:DstLocalPath) { try { New-Item -ItemType Directory -Path (Join-Path $Global:DstLocalPath $fName) -ErrorAction Stop | Out-Null } catch {} }
     elseif ($Global:DstProvider -eq "GCS") {
         $tempPh = Join-Path $Global:AppDir ".placeholder"; if (-not (Test-Path $tempPh)) { try { $null | Out-File -FilePath $tempPh -Encoding utf8 -ErrorAction Stop } catch {} }
-        $destUri = if ($Global:DstPath) { "gs://$($CmbDstBucList.Text)/$($Global:DstPath.Trim('/'))/$fName/.placeholder" } else { "gs://$($CmbDstBucList.Text)/$fName/.placeholder" }
-        $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
-        
-        $projArg = ""
-        if (-not [string]::IsNullOrWhiteSpace($CmbDstProjList.SelectedItem) -and $CmbDstProjList.SelectedItem -notmatch "No Project") {
-            $projArg = " --project=`"$($CmbDstProjList.SelectedItem)`""
+        if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount" -and $Global:RcloneExe) {
+            $destSub = if ($Global:DstPath) { "$($Global:DstPath.Trim('/'))/$fName/.placeholder" } else { "$fName/.placeholder" }
+            $target = "${Global:GcsBridgeName}:$($CmbDstBucList.Text)/$destSub"
+            $args = "copyto `"$tempPh`" `"$target`" --config `"$Global:TempConfig`""
+            try { [System.Diagnostics.Process]::Start((New-Object System.Diagnostics.ProcessStartInfo -Property @{FileName=$Global:RcloneExe; Arguments=$args; WindowStyle="Hidden"; CreateNoWindow=$true})).WaitForExit() } catch {}
+        } else {
+            $destUri = if ($Global:DstPath) { "gs://$($CmbDstBucList.Text)/$($Global:DstPath.Trim('/'))/$fName/.placeholder" } else { "gs://$($CmbDstBucList.Text)/$fName/.placeholder" }
+            $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+            
+            $projArg = ""
+            if (-not [string]::IsNullOrWhiteSpace($CmbDstProjList.SelectedItem) -and $CmbDstProjList.SelectedItem -notmatch "No Project") {
+                $projArg = " --project=`"$($CmbDstProjList.SelectedItem)`""
+            }
+            
+            try { [System.Diagnostics.Process]::Start((New-Object System.Diagnostics.ProcessStartInfo -Property @{FileName="cmd.exe"; Arguments="/c `"`"$gcloudToolPath`" storage cp `"$tempPh`" `"$destUri`"$projArg`""; WindowStyle="Hidden"; CreateNoWindow=$true})).WaitForExit() } catch {}
         }
-        
-        try { [System.Diagnostics.Process]::Start((New-Object System.Diagnostics.ProcessStartInfo -Property @{FileName="cmd.exe"; Arguments="/c `"`"$gcloudToolPath`" storage cp `"$tempPh`" `"$destUri`"$projArg`""; WindowStyle="Hidden"; CreateNoWindow=$true})).WaitForExit() } catch {}
     } elseif ($Global:DstProvider -eq "GDRIVE") {
         $target = "${Global:RemoteName}:${Global:DstPath}$fName"
         if ($CmbDstProjList.SelectedItem -eq "Shared Drive" -and $Global:DriveMap.ContainsKey($CmbDstBucList.Text)) {
@@ -1734,11 +2010,7 @@ $BtnUpload.Add_Click({
 
     $Global:IsTransferring = $true
     
-    $FreezeColor = if ($Global:AppSettings.IsDarkMode) { [System.Drawing.Color]::FromArgb(255, 60, 60, 60) } else { [System.Drawing.Color]::FromArgb(255, 230, 230, 230) }
-    $LvwTasks.BackColor = $FreezeColor
-    $ChkExclusions.BackColor = $FreezeColor
-    $LbxSrcDir.BackColor = $FreezeColor
-    $LbxDstDir.BackColor = $FreezeColor
+
     
     $BtnNewTask.Enabled = $false; $BtnDelTask.Enabled = $false; $BtnClearAll.Enabled = $false; $BtnDuplicate.Enabled = $false
     $BtnSrcLoc.Enabled = $false; $BtnSrcFilter.Enabled = $false; $BtnDstLoc.Enabled = $false; $BtnDstNewF.Enabled = $false; $BtnDstRef.Enabled = $false
@@ -1758,36 +2030,41 @@ $BtnUpload.Add_Click({
     Log-Message "--- TRANSFER STARTED ---" "Cyan"
     [System.Windows.Forms.Application]::DoEvents() 
 
-    $UseGCloud = (($Global:SrcProvider -eq "LOCAL" -and $Global:DstProvider -eq "GCS") -or 
-                  ($Global:SrcProvider -eq "GCS" -and $Global:DstProvider -eq "LOCAL") -or 
-                  ($Global:SrcProvider -eq "GCS" -and $Global:DstProvider -eq "GCS"))
+   $UseGCloud = (-not $Global:AppSettings.ForceRcloneGcs) -and ($Global:AppSettings.GcsAuthType -ne "ServiceAccount") -and (
+              ($Global:SrcProvider -eq "LOCAL" -and $Global:DstProvider -eq "GCS") -or 
+              ($Global:SrcProvider -eq "GCS" -and $Global:DstProvider -eq "LOCAL") -or 
+              ($Global:SrcProvider -eq "GCS" -and $Global:DstProvider -eq "GCS"))
 
     if (($Global:SrcProvider -eq "GCS" -or $Global:DstProvider -eq "GCS") -and -not $UseGCloud) {
-        $adcPath = Join-Path $env:APPDATA "gcloud\application_default_credentials.json"
-        try {
-            if (-not (Test-Path $adcPath -ErrorAction Stop)) {
-                Log-Message "Missing Application Default Credentials for cross-Cloud connection. Requesting..." "Yellow"
-                $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
-                try {
-                    $pInfo = New-Object System.Diagnostics.ProcessStartInfo
-                    $pInfo.FileName = "cmd.exe"
-                    $pInfo.Arguments = "/c `"`"$gcloudToolPath`" auth application-default login`""
-                    $pInfo.UseShellExecute = $false
-                    $pInfo.CreateNoWindow = $false
-                    $p = [System.Diagnostics.Process]::Start($pInfo)
-                    $p.WaitForExit()
-                    
-                    if ($p.ExitCode -ne 0 -or -not (Test-Path $adcPath -ErrorAction Stop)) {
-                        Log-Message "Failed to acquire ADC credentials. Rclone requires this to bridge to GCS. Transfer aborted." "LightCoral"
+        if ($Global:AppSettings.GcsAuthType -eq "ServiceAccount" -and -not [string]::IsNullOrWhiteSpace($Global:AppSettings.GcsServiceAccountKeyPath) -and (Test-Path -LiteralPath $Global:AppSettings.GcsServiceAccountKeyPath)) {
+            $env:GOOGLE_APPLICATION_CREDENTIALS = $Global:AppSettings.GcsServiceAccountKeyPath
+        } else {
+            $adcPath = Join-Path $env:APPDATA "gcloud\application_default_credentials.json"
+            try {
+                if (-not (Test-Path $adcPath -ErrorAction Stop)) {
+                    Log-Message "Missing Application Default Credentials for cross-Cloud connection. Requesting..." "Yellow"
+                    $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+                    try {
+                        $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+                        $pInfo.FileName = "cmd.exe"
+                        $pInfo.Arguments = "/c `"`"$gcloudToolPath`" auth application-default login`""
+                        $pInfo.UseShellExecute = $false
+                        $pInfo.CreateNoWindow = $false
+                        $p = [System.Diagnostics.Process]::Start($pInfo)
+                        $p.WaitForExit()
+                        
+                        if ($p.ExitCode -ne 0 -or -not (Test-Path $adcPath -ErrorAction Stop)) {
+                            Log-Message "Failed to acquire ADC credentials. Rclone requires this to bridge to GCS. Transfer aborted." "LightCoral"
+                            $Global:StopTransfer = $true
+                        }
+                    } catch {
+                        Log-Message "Failed to launch gcloud to acquire ADC credentials. Transfer aborted." "LightCoral"
                         $Global:StopTransfer = $true
                     }
-                } catch {
-                    Log-Message "Failed to launch gcloud to acquire ADC credentials. Transfer aborted." "LightCoral"
-                    $Global:StopTransfer = $true
                 }
-            }
-            if (Test-Path $adcPath -ErrorAction Stop) { $env:GOOGLE_APPLICATION_CREDENTIALS = $adcPath }
-        } catch {}
+                if (Test-Path $adcPath -ErrorAction Stop) { $env:GOOGLE_APPLICATION_CREDENTIALS = $adcPath }
+            } catch {}
+        }
     }
 
     if ($Global:StopTransfer -eq $false) {
@@ -1879,18 +2156,54 @@ $BtnUpload.Add_Click({
             } catch { $Global:TotalTransferItems = -1 }
         } elseif ($Global:SrcProvider -eq "GCS") {
             try {
-                $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
-                
-                $projArg = ""
-                if (-not [string]::IsNullOrWhiteSpace($CmbSrcProjList.SelectedItem) -and $CmbSrcProjList.SelectedItem -notmatch "No Project") {
-                    $projArg = "--project=`"$($CmbSrcProjList.SelectedItem)`" "
-                }
-                
-                if ($incItems.Count -gt 0 -and $totCount -gt 0) {
-                    foreach ($incObj in $incItems) {
-                        $sTarget = "$gSrcBase/$($incObj.Name)" -replace '(?<!gs:)/{2,}', '/'
-                        if ($incObj.IsDir) { $lsArgs = "storage ls `"$sTarget/**`" $projArg" } else { $lsArgs = "storage ls `"$sTarget`" $projArg" }
-                        if ($Global:AppSettings.IsDebugMode) { Log-Message "DEBUG: Scanning cloud path via: $lsArgs" "DarkGray" }
+                if (($Global:AppSettings.GcsAuthType -eq "ServiceAccount" -or $Global:AppSettings.ForceRcloneGcs) -and $Global:RcloneExe) {
+                    if ($incItems.Count -gt 0 -and $totCount -gt 0) {
+                        foreach ($incObj in $incItems) {
+                            $rSub = if ($Global:SrcPath) { "$($Global:SrcPath.Trim('/'))/$($incObj.Name)" } else { $incObj.Name }
+                            $szRes = Execute-Cli-Json -cmdArgs "size `"${Global:GcsBridgeName}:$($CmbSrcBucList.Text)/$rSub`" --json --config `"$Global:TempConfig`"" -isRclone $true
+                            if ($szRes -and $szRes.count -ne $null) {
+                                $Global:TotalTransferItems += [int]$szRes.count
+                            }
+                            [System.Windows.Forms.Application]::DoEvents()
+                        }
+                    } else {
+                        $rSub = if ($Global:SrcPath) { $Global:SrcPath.Trim('/') } else { "" }
+                        $szRes = Execute-Cli-Json -cmdArgs "size `"${Global:GcsBridgeName}:$($CmbSrcBucList.Text)/$rSub`" --json --config `"$Global:TempConfig`"" -isRclone $true
+                        if ($szRes -and $szRes.count -ne $null) {
+                            $Global:TotalTransferItems += [int]$szRes.count
+                        }
+                    }
+                } else {
+                    $gcloudToolPath = if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" }
+                    
+                    $projArg = ""
+                    if (-not [string]::IsNullOrWhiteSpace($CmbSrcProjList.SelectedItem) -and $CmbSrcProjList.SelectedItem -notmatch "No Project") {
+                        $projArg = "--project=`"$($CmbSrcProjList.SelectedItem)`" "
+                    }
+                    
+                    if ($incItems.Count -gt 0 -and $totCount -gt 0) {
+                        foreach ($incObj in $incItems) {
+                            $sTarget = "$gSrcBase/$($incObj.Name)" -replace '(?<!gs:)/{2,}', '/'
+                            if ($incObj.IsDir) { $lsArgs = "storage ls `"$sTarget/**`" $projArg" } else { $lsArgs = "storage ls `"$sTarget`" $projArg" }
+                            if ($Global:AppSettings.IsDebugMode) { Log-Message "DEBUG: Scanning cloud path via: $lsArgs" "DarkGray" }
+                            
+                            $pInfoLs = New-Object System.Diagnostics.ProcessStartInfo
+                            $pInfoLs.FileName = "cmd.exe"
+                            $pInfoLs.Arguments = "/c `"cd /d `"$env:TEMP`" && call `"$gcloudToolPath`" $lsArgs`""
+                            $pInfoLs.RedirectStandardOutput = $true
+                            $pInfoLs.UseShellExecute = $false
+                            $pInfoLs.CreateNoWindow = $true
+                            $pInfoLs.WorkingDirectory = $env:TEMP
+                            $pLs = [System.Diagnostics.Process]::Start($pInfoLs)
+                            $lsOut = $pLs.StandardOutput.ReadToEnd()
+                            $pLs.WaitForExit()
+                            $Global:TotalTransferItems += ($lsOut -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -match "^gs://" -and $_ -notmatch "/$" }).Count
+                            [System.Windows.Forms.Application]::DoEvents()
+                        }
+                    } else {
+                        $sTarget = if ($gSrcBase.EndsWith('/')) { $gSrcBase } else { $gSrcBase + '/' }
+                        $lsArgs = "storage ls `"$sTarget**`" $projArg"
+                        if ($Global:AppSettings.IsDebugMode) { Log-Message "DEBUG: Scanning cloud root via: $lsArgs" "DarkGray" }
                         
                         $pInfoLs = New-Object System.Diagnostics.ProcessStartInfo
                         $pInfoLs.FileName = "cmd.exe"
@@ -1902,23 +2215,7 @@ $BtnUpload.Add_Click({
                         $lsOut = $pLs.StandardOutput.ReadToEnd()
                         $pLs.WaitForExit()
                         $Global:TotalTransferItems += ($lsOut -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -match "^gs://" -and $_ -notmatch "/$" }).Count
-                        [System.Windows.Forms.Application]::DoEvents()
                     }
-                } else {
-                    $sTarget = if ($gSrcBase.EndsWith('/')) { $gSrcBase } else { $gSrcBase + '/' }
-                    $lsArgs = "storage ls `"$sTarget**`" $projArg"
-                    if ($Global:AppSettings.IsDebugMode) { Log-Message "DEBUG: Scanning cloud root via: $lsArgs" "DarkGray" }
-                    
-                    $pInfoLs = New-Object System.Diagnostics.ProcessStartInfo
-                    $pInfoLs.FileName = "cmd.exe"
-                    $pInfoLs.Arguments = "/c `"call `"$gcloudToolPath`" $lsArgs`""
-                    $pInfoLs.RedirectStandardOutput = $true
-                    $pInfoLs.UseShellExecute = $false
-                    $pInfoLs.CreateNoWindow = $true
-                    $pLs = [System.Diagnostics.Process]::Start($pInfoLs)
-                    $lsOut = $pLs.StandardOutput.ReadToEnd()
-                    $pLs.WaitForExit()
-                    $Global:TotalTransferItems += ($lsOut -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -match "^gs://" -and $_ -notmatch "/$" }).Count
                 }
             } catch { $Global:TotalTransferItems = -1 }
         } else {
@@ -1929,7 +2226,7 @@ $BtnUpload.Add_Click({
         [System.Windows.Forms.Application]::DoEvents()
 
         $Global:BatFile = Join-Path $env:TEMP "run_transfer_$taskId.bat"
-        $batContent = "@echo off`nchcp 65001 >nul`n"
+        $batContent = "@echo off`ncd /d `"$env:TEMP`"`nchcp 65001 >nul`n"
         
         $Global:ExcludeFile = ""
         if (-not $UseGCloud) {
@@ -2329,7 +2626,7 @@ $BtnUpload.Add_Click({
             "Total Processed : $totalProcessed"
             "================================================="
         )
-        $summaryColor = if ($finalStatus -eq "Error") { "LightCoral" } elseif ($finalStatus -eq "Aborted") { "Yellow" } else { "Cyan" }
+        $summaryColor = "LightGray"
         foreach ($sl in $summaryLines) { Log-Message $sl $summaryColor }
 
         $CleanLogString = if ($Global:FullLogLines -and $Global:FullLogLines.Count -gt 0) { $Global:FullLogLines -join "`n" } else { $RtbLog.Text }
@@ -2383,10 +2680,6 @@ $CleanLogString
     $Global:IsTransferring = $false
     $Global:CurrentProcess = $null
     
-    $LvwTasks.BackColor = $InputColor
-    $ChkExclusions.BackColor = $InputColor
-    $LbxSrcDir.BackColor = $InputColor
-    $LbxDstDir.BackColor = $InputColor
     
     $BtnNewTask.Enabled = $true; $BtnDelTask.Enabled = $true; $BtnClearAll.Enabled = $true; $BtnDuplicate.Enabled = $true
     $BtnSrcLoc.Enabled = $true; $BtnSrcFilter.Enabled = $true; $BtnDstLoc.Enabled = $true; $BtnDstNewF.Enabled = $true; $BtnDstRef.Enabled = $true
