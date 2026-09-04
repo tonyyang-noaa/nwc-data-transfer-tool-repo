@@ -876,7 +876,7 @@ function Show-SettingsDialog {
         }
     })
     $btnClearSA.Add_Click({ $txtSAKey.Text = "" })
-    $btnHelp.Add_Click({ [System.Diagnostics.Process]::Start("https://docs.google.com/document/d/1Hm5I8qBpaZQ3gEyMJzXjGdOEZCYV5gNFaeLhKkFZ-u8/edit?usp=sharing") | Out-Null })
+    $btnHelp.Add_Click({ [System.Diagnostics.Process]::Start("https://github.com/tonyyang-noaa/nwc-data-transfer-tool-repo/blob/main/USER_GUIDE.md") | Out-Null })
     $btnSave.Add_Click({ 
         $Global:AppSettings.RclonePath = $txtR.Text
         $Global:AppSettings.GCloudPath = $txtG.Text
