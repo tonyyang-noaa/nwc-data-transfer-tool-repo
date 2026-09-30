@@ -75,7 +75,14 @@ $Global:RemoteName = "GWorkspaceAuth"
 $Global:GcsBridgeName = "GCSBridge"
 
 $Global:ScriptDir = $PSScriptRoot
-if ([string]::IsNullOrEmpty($Global:ScriptDir)) { $Global:ScriptDir = [System.IO.Path]::GetDirectoryName([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) }
+if ([string]::IsNullOrEmpty($Global:ScriptDir)) { 
+    try {
+        $Global:ScriptDir = [System.IO.Path]::GetDirectoryName([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+    } catch {}
+}
+if ([string]::IsNullOrEmpty($Global:ScriptDir)) { 
+    $Global:ScriptDir = (Get-Location).Path
+}
 
 # --- 1. SYSTEM ENVIRONMENT & SETTINGS ---
 try { Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\python.exe" -Name "(Default)" -ErrorAction Stop } catch {}
@@ -303,18 +310,18 @@ $Form.ClientSize = New-Object System.Drawing.Size($AppWidth, $AppHeight)
 $Form.MinimumSize = New-Object System.Drawing.Size(1100, 750)
 $Form.StartPosition = "CenterScreen"
 
-$iconPath = Join-Path $PSScriptRoot "network_transfer.ico"
-if (Test-Path -LiteralPath $iconPath) {
-    try { $Form.Icon = New-Object System.Drawing.Icon($iconPath) } catch {}
-} else {
-    try {
+try {
+    $iconPath = if (-not [string]::IsNullOrEmpty($Global:ScriptDir)) { Join-Path -Path $Global:ScriptDir -ChildPath "network_transfer.ico" } else { "network_transfer.ico" }
+    if ($iconPath -and (Test-Path -LiteralPath $iconPath -ErrorAction SilentlyContinue)) {
+        $Form.Icon = New-Object System.Drawing.Icon($iconPath)
+    } else {
         $procPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-        if ($procPath -and (Test-Path -LiteralPath $procPath) -and $procPath.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
+        if ($procPath -and (Test-Path -LiteralPath $procPath -ErrorAction SilentlyContinue) -and $procPath.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
             $extractedIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($procPath)
             if ($extractedIcon) { $Form.Icon = $extractedIcon }
         }
-    } catch {}
-}
+    }
+} catch {}
 
 $BgColor = [System.Drawing.Color]::FromArgb(255, 30, 30, 30); $PanelColor = [System.Drawing.Color]::FromArgb(255, 45, 45, 48)    
 $InputColor = [System.Drawing.Color]::FromArgb(255, 37, 37, 38); $TextColor = [System.Drawing.Color]::White                         
@@ -890,11 +897,11 @@ function Show-SettingsDialog {
     })
     $btnHelp.Add_Click({ 
         $guideUrl = "https://github.com/tonyyang-noaa/nwc-data-transfer-tool-repo/blob/main/USER_GUIDE.md"
-        $localGuide = Join-Path $PSScriptRoot "USER_GUIDE.md"
+        $localGuide = if (-not [string]::IsNullOrEmpty($Global:ScriptDir)) { Join-Path -Path $Global:ScriptDir -ChildPath "USER_GUIDE.md" } else { "USER_GUIDE.md" }
         try {
             Start-Process $guideUrl
         } catch {
-            if (Test-Path -LiteralPath $localGuide) {
+            if ($localGuide -and (Test-Path -LiteralPath $localGuide -ErrorAction SilentlyContinue)) {
                 Start-Process $localGuide
             }
         }
