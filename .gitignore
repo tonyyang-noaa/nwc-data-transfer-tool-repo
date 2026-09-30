@@ -1,0 +1,98 @@
+# CRITICAL: Environment variables and secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+.env.*
+
+# Cognito credentials and configuration with secrets
+cognito-config-secrets.json
+aws-credentials.json
+client-secrets.*
+data/credentials/application_default_credentials.json
+
+# Node.js dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# Next.js build outputs
+.next/
+out/
+build/
+dist/
+
+# Testing
+coverage/
+.nyc_output/
+.pytest_cache/
+
+# IDE and Editor files
+.vscode/settings.json
+.vscode/launch.json
+.agents/
+.claude/
+.github/
+graphify-out/
+scripts/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.log
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+ui-mockup.html
+network_transfer.ico
+
+# Lock files (optional - uncomment if you want to ignore them)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# Local Vercel deployment configuration
+.vercel
+
+# Backup files
+*.backup
+*.bak
+*.old
+
+# Documentation that may contain sensitive info
+# Uncomment if needed:
+# NOTES.md
+# SCRATCH.md
+
+# JMeter test results and configurations with tokens
+jmeter-results/
+*.jmx.bak
+test-tokens.txt
+
+# Any files containing "secret" or "credential" in the name
+*secret*
+*credential*
+*password*
+*token*
+
+# AWS and cloud provider credentials
+.aws/
+.azure/
+.gcloud/
+
+# SSH keys
+*.pem
+*.key
+id_rsa*
