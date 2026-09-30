@@ -8,7 +8,7 @@
 
 ## Guide Version & Compatibility
 * **Target PowerShell Script**: `data_transfer_tool.ps1`
-* **Application Version**: `v1.1.50`
+* **Application Version**: `v1.1.51`
 * **Last Updated**: September 2026
 
 > **Note on Maintenance**: This document is synchronized directly with `data_transfer_tool.ps1`. Whenever new features, settings, or authentication options are introduced in script version updates, this User Guide is updated accordingly.
@@ -36,7 +36,7 @@ The **Data Transfer Tool** is a PowerShell Windows Forms application designed fo
 
 ```
 +---------------------------------------------------------------------------------------------------------+
-| Data Transfer Tool v1.1.50                                                                    [_][square][X] |
+| Data Transfer Tool v1.1.51                                                                    [_][square][X] |
 +---------------------------------------------------------------------------------------------------------+
 | [ Left Panel ]            | [ Source Storage Panel ]            | [ Target Storage Panel ]              |
 | - Dark Mode Toggle        | - Provider: LOCAL / GCS / GDRIVE    | - Provider: LOCAL / GCS / GDRIVE      |
@@ -115,15 +115,16 @@ Use this workflow to upload data from local disks or network drives to a Google 
    - Select **`User Account (OAuth)`** in the Auth Method dropdown.
    - If not logged in, click **Login/Auth**. The tool executes `gcloud auth login` and `gcloud auth application-default login`. Complete the login in your web browser.
    - Select your GCP Project from the **Project** dropdown.
-   - Select your target bucket from the **Bucket** dropdown.
-   - *Manual Override*: If your account lacks project-level listing permissions (`roles/viewer`), select **`[ No Project ID (Manual) ]`** in the Project dropdown and manually type your bucket name into the Bucket field, then press **Enter**.
+   - **Automatic Bucket Discovery**: Once a valid project is selected, the tool automatically queries Google Cloud and populates all accessible buckets into the Bucket dropdown (starting with `--- Select Bucket ---`).
+   - Select your target bucket from the dropdown to automatically load its directory listing.
+   - *Manual Entry & Fallback*: If your account only has bucket-level access (without project-level `storage.buckets.list` permissions) or you selected **`[ No Project ID (Manual) ]`**, the dropdown remains editable (`DropDown` style). Simply type the bucket name into the field and press **Enter** to open it.
 
    ##### Method 2: Service Account JSON Key (Headless / Automated)
    - Select **`Service Account (.json)`** in the Auth Method dropdown (or configure via Settings).
    - Click **Select Key** and select your Service Account `.json` key file.
    - The application validates the key file, activates the Service Account, and automatically populates/locks the associated Project ID.
-   - Select or type the target bucket name.
-   - *Advantage*: Service Account transfers run headless via Rclone using bucket-level IAM permissions (`roles/storage.objectAdmin`), bypassing project-wide service usage checks.
+   - The tool attempts to auto-populate accessible buckets for that project. If the Service Account only has bucket-level IAM roles (`roles/storage.objectAdmin`), the bucket field gracefully reverts to manual text mode (`Type Bucket & Press Enter...`), allowing you to type the target bucket name directly and press **Enter**.
+   - *Advantage*: Service Account transfers run headless via Rclone using bucket-level IAM permissions, bypassing project-wide service usage checks.
 
 3. Navigate to the target subfolder by double-clicking directory rows, or click **New Folder** to create a new folder path in the bucket.
 

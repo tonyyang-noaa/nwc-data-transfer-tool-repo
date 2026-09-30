@@ -296,12 +296,25 @@ function Save-Tasks { $Global:Tasks | ConvertTo-Json -Depth 10 | Out-File -Liter
 
 # --- 2. GUI INITIALIZATION (SIDE-BY-SIDE LAYOUT) ---
 $Form = New-Object System.Windows.Forms.Form
-$Form.Text = "Data Transfer Tool v1.1.50"
+$Form.Text = "Data Transfer Tool v1.1.51"
 $ScreenArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $AppWidth = 1250; $AppHeight = if ($ScreenArea.Height -lt 850) { [math]::Max(750, $ScreenArea.Height - 50) } else { 850 }
 $Form.ClientSize = New-Object System.Drawing.Size($AppWidth, $AppHeight)
 $Form.MinimumSize = New-Object System.Drawing.Size(1100, 750)
 $Form.StartPosition = "CenterScreen"
+
+$iconPath = Join-Path $PSScriptRoot "network_transfer.ico"
+if (Test-Path -LiteralPath $iconPath) {
+    try { $Form.Icon = New-Object System.Drawing.Icon($iconPath) } catch {}
+} else {
+    try {
+        $procPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        if ($procPath -and (Test-Path -LiteralPath $procPath) -and $procPath.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $extractedIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($procPath)
+            if ($extractedIcon) { $Form.Icon = $extractedIcon }
+        }
+    } catch {}
+}
 
 $BgColor = [System.Drawing.Color]::FromArgb(255, 30, 30, 30); $PanelColor = [System.Drawing.Color]::FromArgb(255, 45, 45, 48)    
 $InputColor = [System.Drawing.Color]::FromArgb(255, 37, 37, 38); $TextColor = [System.Drawing.Color]::White                         
@@ -444,7 +457,7 @@ function Build-BrowserPanel($Panel, $TitleStr, $Prefix) {
             $IsSource = ($sender -eq $Global:CmbSrcBucList)
             $locLbx  = if ($IsSource) { $Global:LbxSrcDir } else { $Global:LbxDstDir }
             $val = $sender.Text.Trim()
-            if (![string]::IsNullOrWhiteSpace($val) -and $val -notmatch "Type Bucket" -and $val -notmatch "--- Bucket ---") {
+            if (![string]::IsNullOrWhiteSpace($val) -and $val -notmatch "Type Bucket" -and $val -notmatch "--- Bucket ---" -and $val -notmatch "Select Bucket" -and $val -notmatch "Loading buckets") {
                 $locLbx.Enabled = $true
                 if ($IsSource) { $Global:SrcPath = "" } else { $Global:DstPath = ""; $Global:BtnDstNewF.Enabled = $true; $Global:BtnDstRef.Enabled = $true }
                 Update-Directory $IsSource
@@ -665,7 +678,7 @@ function Execute-Cli-Result($cmdArgs, [bool]$isRclone = $false) {
 }
 
 function Get-GcsProjectArg([object]$ProjectValue) {
-    if (-not [string]::IsNullOrWhiteSpace($ProjectValue) -and $ProjectValue -notmatch "No Project") {
+    if (-not [string]::IsNullOrWhiteSpace($ProjectValue) -and $ProjectValue -notmatch "No Project" -and $ProjectValue -notmatch "^---") {
         return "--project=`"$ProjectValue`""
     }
     return ""
@@ -875,8 +888,17 @@ function Show-SettingsDialog {
             }
         }
     })
-    $btnClearSA.Add_Click({ $txtSAKey.Text = "" })
-    $btnHelp.Add_Click({ [System.Diagnostics.Process]::Start("https://github.com/tonyyang-noaa/nwc-data-transfer-tool-repo/blob/main/USER_GUIDE.md") | Out-Null })
+    $btnHelp.Add_Click({ 
+        $guideUrl = "https://github.com/tonyyang-noaa/nwc-data-transfer-tool-repo/blob/main/USER_GUIDE.md"
+        $localGuide = Join-Path $PSScriptRoot "USER_GUIDE.md"
+        try {
+            Start-Process $guideUrl
+        } catch {
+            if (Test-Path -LiteralPath $localGuide) {
+                Start-Process $localGuide
+            }
+        }
+    })
     $btnSave.Add_Click({ 
         $Global:AppSettings.RclonePath = $txtR.Text
         $Global:AppSettings.GCloudPath = $txtG.Text
@@ -1139,7 +1161,7 @@ function Update-Directory([bool]$IsSrc) {
 
     $rawParsedItems = @()
     if ($Prov -eq "GCS" -or $Prov -eq "GDRIVE") {
-        if ($Prov -eq "GCS" -and ([string]::IsNullOrWhiteSpace($Buc) -or $Buc -match "Select Bucket" -or $Buc -match "--- Bucket ---" -or $Buc -match "Type Bucket")) { $Form.Cursor = [System.Windows.Forms.Cursors]::Default; return }
+        if ($Prov -eq "GCS" -and ([string]::IsNullOrWhiteSpace($Buc) -or $Buc -match "Select Bucket" -or $Buc -match "--- Bucket ---" -or $Buc -match "Type Bucket" -or $Buc -match "Loading buckets")) { $Form.Cursor = [System.Windows.Forms.Cursors]::Default; return }
         $LblP.Text = if ($Prov -eq "GCS") { "Path: gs://$Buc/$Pth" } else { "Path: /$Pth" }
         # Ensures $IsSrc is correctly passed downward to identify the billing project
         $rawParsedItems = Get-CloudItems $Prov $Buc $Pth $false $IsSrc
@@ -1838,12 +1860,92 @@ function Handle-ProjChange([bool]$IsSrc) {
     $CmbProj = if($IsSrc){$CmbSrcProjList}else{$CmbDstProjList}; $CmbBuc = if($IsSrc){$CmbSrcBucList}else{$CmbDstBucList}
     
     if($Prov -eq "GCS") {
-        # Force manual entry for all GCS buckets
         $CmbBuc.DropDownStyle = "DropDown"
-        $CmbBuc.Items.Clear()
-        $CmbBuc.Text = "Type Bucket & Press Enter..."
-        $CmbBuc.Enabled = $true
-        $CmbBuc.Visible = $true
+        $selectedProj = [string]$CmbProj.SelectedItem
+        
+        if ($selectedProj -eq "[ No Project ID (Manual) ]") {
+            $CmbBuc.Items.Clear()
+            $CmbBuc.Text = "Type Bucket & Press Enter..."
+            $CmbBuc.Enabled = $true
+            $CmbBuc.Visible = $true
+        } elseif ([string]::IsNullOrWhiteSpace($selectedProj) -or $selectedProj -match "^---") {
+            $CmbBuc.Items.Clear()
+            $CmbBuc.Text = ""
+            $CmbBuc.Enabled = $false
+        } else {
+            $CmbBuc.Items.Clear()
+            $CmbBuc.Text = "Loading buckets..."
+            $CmbBuc.Enabled = $false
+            $CmbBuc.Visible = $true
+            $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            [System.Windows.Forms.Application]::DoEvents()
+            
+            $projArg = Get-GcsProjectArg $selectedProj
+            $discoveredBuckets = [System.Collections.Generic.List[string]]::new()
+            
+            # Tier 1: gcloud storage buckets list --format=json
+            try {
+                $bucketsJson = Execute-Cli-Json -cmdArgs (("storage buckets list {0} --format=json" -f $projArg).Trim()) -isRclone $false
+                if ($bucketsJson) {
+                    $bArray = if ($bucketsJson -is [array]) { $bucketsJson } else { @($bucketsJson) }
+                    foreach ($b in $bArray) {
+                        $bName = if ($b.name) { [string]$b.name } elseif ($b.id) { [string]$b.id } else { $null }
+                        if (-not [string]::IsNullOrWhiteSpace($bName)) {
+                            $bClean = $bName.Trim() -replace '^gs://', '' -replace '/$', ''
+                            if (-not [string]::IsNullOrWhiteSpace($bClean) -and -not $discoveredBuckets.Contains($bClean)) {
+                                $discoveredBuckets.Add($bClean)
+                            }
+                        }
+                    }
+                }
+            } catch {}
+            
+            # Tier 2: gcloud storage buckets list (text fallback)
+            if ($discoveredBuckets.Count -eq 0) {
+                try {
+                    $bucketText = Execute-Cli-Text -cmdArgs (("storage buckets list {0}" -f $projArg).Trim()) -isRclone $false
+                    if (-not [string]::IsNullOrWhiteSpace($bucketText)) {
+                        foreach ($line in ($bucketText -split "`r?`n")) {
+                            $bClean = $line.Trim() -replace '^gs://', '' -replace '/$', ''
+                            if (-not [string]::IsNullOrWhiteSpace($bClean) -and $bClean -notmatch '^NAME\s*$' -and -not $discoveredBuckets.Contains($bClean)) {
+                                $discoveredBuckets.Add($bClean)
+                            }
+                        }
+                    }
+                } catch {}
+            }
+            
+            # Tier 3: Legacy gsutil ls -p <project> fallback
+            if ($discoveredBuckets.Count -eq 0) {
+                try {
+                    $gsBuckets = Execute-Gsutil-Result -cmdArgs "ls -p `"$selectedProj`""
+                    if (-not [string]::IsNullOrWhiteSpace($gsBuckets.Output)) {
+                        foreach ($line in ($gsBuckets.Output -split "`r?`n")) {
+                            $bClean = $line.Trim() -replace '^gs://', '' -replace '/$', ''
+                            if (-not [string]::IsNullOrWhiteSpace($bClean) -and -not $bClean.StartsWith("TOTAL:") -and -not $discoveredBuckets.Contains($bClean)) {
+                                $discoveredBuckets.Add($bClean)
+                            }
+                        }
+                    }
+                } catch {}
+            }
+            
+            $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+            $CmbBuc.Items.Clear()
+            
+            if ($discoveredBuckets.Count -gt 0) {
+                [void]$CmbBuc.Items.Add("--- Select Bucket ---")
+                foreach ($b in $discoveredBuckets) {
+                    [void]$CmbBuc.Items.Add($b)
+                }
+                $CmbBuc.Enabled = $true
+                $CmbBuc.SelectedIndex = 0
+            } else {
+                # Fallback to manual entry if no buckets found or permission denied (403)
+                $CmbBuc.Text = "Type Bucket & Press Enter..."
+                $CmbBuc.Enabled = $true
+            }
+        }
     } elseif ($Prov -eq "GDRIVE") {
         $CmbBuc.DropDownStyle = "DropDownList"
         if($IsSrc){$Global:SrcPath=""}else{$Global:DstPath=""}
@@ -1958,12 +2060,12 @@ $BtnUpload.Add_Click({
     
     if ($Global:SrcProvider -eq "GCS") {
         $sBuc = $CmbSrcBucList.Text
-        if ([string]::IsNullOrWhiteSpace($sBuc) -or $sBuc -match "--- Bucket ---" -or $sBuc -match "Type Bucket") { Log-Message "Source Bucket not selected." "LightCoral"; return }
+        if ([string]::IsNullOrWhiteSpace($sBuc) -or $sBuc -match "--- Bucket ---" -or $sBuc -match "Select Bucket" -or $sBuc -match "Type Bucket" -or $sBuc -match "Loading buckets") { Log-Message "Source Bucket not selected." "LightCoral"; return }
     }
     
     if ($Global:DstProvider -eq "GCS") {
         $dBuc = $CmbDstBucList.Text
-        if ([string]::IsNullOrWhiteSpace($dBuc) -or $dBuc -match "--- Bucket ---" -or $dBuc -match "Type Bucket") { Log-Message "Target Bucket not selected." "LightCoral"; return }
+        if ([string]::IsNullOrWhiteSpace($dBuc) -or $dBuc -match "--- Bucket ---" -or $dBuc -match "Select Bucket" -or $dBuc -match "Type Bucket" -or $dBuc -match "Loading buckets") { Log-Message "Target Bucket not selected." "LightCoral"; return }
     }
 
     if ([string]::IsNullOrWhiteSpace($TxtTaskName.Text)) { $TxtTaskName.Text = "Transfer $(Get-Date -Format 'MM-dd HH:mm')" }
