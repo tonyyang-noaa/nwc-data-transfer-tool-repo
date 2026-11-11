@@ -303,7 +303,7 @@ function Save-Tasks { $Global:Tasks | ConvertTo-Json -Depth 10 | Out-File -Liter
 
 # --- 2. GUI INITIALIZATION (SIDE-BY-SIDE LAYOUT) ---
 $Form = New-Object System.Windows.Forms.Form
-$Form.Text = "Data Transfer Tool v1.1.51"
+$Form.Text = "Data Transfer Tool v1.1.52"
 $ScreenArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $AppWidth = 1250; $AppHeight = if ($ScreenArea.Height -lt 850) { [math]::Max(750, $ScreenArea.Height - 50) } else { 850 }
 $Form.ClientSize = New-Object System.Drawing.Size($AppWidth, $AppHeight)
@@ -582,15 +582,66 @@ function New-BrowserListItem([int]$Type, [string]$Name, [DateTime]$RawDate = [Da
     }
 }
 
-# REFACTORED CLI EXECUTION: Uses native Invoke-Expression wrapper with robust JSON extraction
+function Invoke-CliProcessNonBlocking([string]$ExePath, [string]$CmdArgs, [int]$TimeoutSeconds = 45) {
+    if ([string]::IsNullOrWhiteSpace($ExePath)) {
+        return [PSCustomObject]@{ ExitCode = -1; Output = ""; Command = "" }
+    }
+
+    $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+    if ($ExePath -match '\.(cmd|bat)$') {
+        $pInfo.FileName = "cmd.exe"
+        $pInfo.Arguments = "/c `"`"$ExePath`" $CmdArgs`""
+    } else {
+        $pInfo.FileName = $ExePath
+        $pInfo.Arguments = $CmdArgs
+    }
+    $pInfo.UseShellExecute = $false
+    $pInfo.CreateNoWindow = $true
+    $pInfo.RedirectStandardOutput = $true
+    $pInfo.RedirectStandardError = $true
+    $pInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $pInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+
+    try {
+        $proc = [System.Diagnostics.Process]::Start($pInfo)
+    } catch {
+        return [PSCustomObject]@{ ExitCode = -1; Output = $_.Exception.Message; Command = "$ExePath $CmdArgs" }
+    }
+
+    $stdOutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stdErrTask = $proc.StandardError.ReadToEndAsync()
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while (-not $proc.HasExited -and $sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 35
+    }
+
+    if (-not $proc.HasExited) {
+        try { $proc.Kill() } catch {}
+        $exitCode = -1
+    } else {
+        $proc.WaitForExit()
+        $exitCode = $proc.ExitCode
+    }
+
+    $stdOut = try { $stdOutTask.GetAwaiter().GetResult() } catch { "" }
+    $stdErr = try { $stdErrTask.GetAwaiter().GetResult() } catch { "" }
+    $combined = if ([string]::IsNullOrWhiteSpace($stdErr)) { $stdOut } elseif ([string]::IsNullOrWhiteSpace($stdOut)) { $stdErr } else { "$stdOut`n$stdErr" }
+
+    return [PSCustomObject]@{
+        ExitCode = $exitCode
+        Output = if ($combined) { $combined } else { "" }
+        Command = "$ExePath $CmdArgs"
+    }
+}
+
+# REFACTORED CLI EXECUTION: Uses non-blocking process wrapper with WinForms event pumping and robust JSON extraction
 function Execute-Cli-Json($cmdArgs, [bool]$isRclone = $false) {
     $exePath = if ($isRclone) { $Global:RcloneExe } else { if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" } }
     
-    $outData = ""
-    try {
-        $cmd = "& `"$exePath`" $cmdArgs 2>&1"
-        $outData = Invoke-Expression $cmd | Out-String
-    } catch {}
+    $res = Invoke-CliProcessNonBlocking -ExePath $exePath -CmdArgs $cmdArgs -TimeoutSeconds 45
+    $outData = $res.Output
     
     if (![string]::IsNullOrWhiteSpace($outData)) {
         $outData = $outData.Trim()
@@ -607,13 +658,8 @@ function Execute-Cli-Json($cmdArgs, [bool]$isRclone = $false) {
 
 function Execute-Cli-Text($cmdArgs, [bool]$isRclone = $false) {
     $exePath = if ($isRclone) { $Global:RcloneExe } else { if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" } }
-
-    try {
-        $cmd = "& `"$exePath`" $cmdArgs 2>&1"
-        return (Invoke-Expression $cmd | Out-String)
-    } catch {
-        return ""
-    }
+    $res = Invoke-CliProcessNonBlocking -ExePath $exePath -CmdArgs $cmdArgs -TimeoutSeconds 45
+    return $res.Output
 }
 
 function Execute-Gsutil-Result($cmdArgs) {
@@ -627,22 +673,7 @@ function Execute-Gsutil-Result($cmdArgs) {
         return [PSCustomObject]@{ ExitCode = -1; Output = "gsutil not found"; Command = "gsutil $cmdArgs" }
     }
 
-    $outData = ""
-    $exitCode = -1
-    try {
-        $cmd = "& `"$($gsutilCmd.Source)`" $cmdArgs 2>&1"
-        $outData = Invoke-Expression $cmd | Out-String
-        $exitCode = $LASTEXITCODE
-    } catch {
-        $outData = ""
-        $exitCode = -1
-    }
-
-    return [PSCustomObject]@{
-        ExitCode = $exitCode
-        Output = if ($outData) { $outData } else { "" }
-        Command = "$($gsutilCmd.Source) $cmdArgs"
-    }
+    return (Invoke-CliProcessNonBlocking -ExePath $gsutilCmd.Source -CmdArgs $cmdArgs -TimeoutSeconds 45)
 }
 
 # Returns a status label that reflects which OAuth credentials are active in the rclone config.
@@ -665,23 +696,7 @@ function Get-DriveAuthLabel {
 
 function Execute-Cli-Result($cmdArgs, [bool]$isRclone = $false) {
     $exePath = if ($isRclone) { $Global:RcloneExe } else { if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" } }
-
-    $outData = ""
-    $exitCode = -1
-    try {
-        $cmd = "& `"$exePath`" $cmdArgs 2>&1"
-        $outData = Invoke-Expression $cmd | Out-String
-        $exitCode = $LASTEXITCODE
-    } catch {
-        $outData = ""
-        $exitCode = -1
-    }
-
-    return [PSCustomObject]@{
-        ExitCode = $exitCode
-        Output = if ($outData) { $outData } else { "" }
-        Command = "$exePath $cmdArgs"
-    }
+    return (Invoke-CliProcessNonBlocking -ExePath $exePath -CmdArgs $cmdArgs -TimeoutSeconds 45)
 }
 
 function Get-GcsProjectArg([object]$ProjectValue) {
@@ -1122,27 +1137,49 @@ function Get-CloudItems([string]$Prov, [string]$Buc, [string]$Pth, [bool]$DirOnl
             }
         }
     } elseif ($Prov -eq "GDRIVE") {
-        # FIXED: Bind Team Drive ID directly to the connection string to decouple My Drive from Shared Drives
-        $target = "${Global:RemoteName}:${Pth}"
-        if ($Buc -and $Global:DriveMap.ContainsKey($Buc)) {
-            $target = "${Global:RemoteName},team_drive=$($Global:DriveMap[$Buc]):${Pth}"
+        $projSel = if ($IsSrc) { $CmbSrcProjList.SelectedItem } else { $CmbDstProjList.SelectedItem }
+        if ($projSel -eq "Shared Drive") {
+            if ([string]::IsNullOrWhiteSpace($Buc) -or $Buc -match "^---") {
+                return $parsed
+            }
+            if (-not $Global:DriveMap.ContainsKey($Buc)) {
+                $d = Execute-Cli-Json -cmdArgs "backend drives `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --contimeout 10s --timeout 15s --retries 1 --json" -isRclone $true
+                if ($d) {
+                    $dArray = if ($d -is [array]) { $d } else { @($d) }
+                    foreach ($i in $dArray) {
+                        if ($i.name -and $i.id) { $Global:DriveMap[$i.name] = $i.id }
+                    }
+                }
+            }
+            if ($Global:DriveMap.ContainsKey($Buc)) {
+                $target = "${Global:RemoteName},team_drive=$($Global:DriveMap[$Buc]):${Pth}"
+            } else {
+                return $parsed
+            }
+        } else {
+            $target = "${Global:RemoteName}:${Pth}"
         }
-        
-        $args = "lsjson `"$target`" --config `"$Global:TempConfig`" --tpslimit 8 --fast-list --drive-use-trash=false --drive-skip-shortcuts --drive-list-chunk=1000"
+
+        $args = "lsjson `"$target`" --config `"$Global:TempConfig`" --max-depth 1 --no-mimetype --drive-use-trash=false --drive-skip-shortcuts --drive-list-chunk=1000 --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1"
         if ($DirOnly) { $args += " --dirs-only" }
-        
+
         $result = Execute-Cli-Json -cmdArgs $args -isRclone $true
         if ($result) { 
             $rArray = if ($result -is [array]) { $result } else { @($result) }
             foreach ($item in $rArray) { 
                 $rawDate = if ($item.ModTime) { try { [DateTime]::Parse($item.ModTime) } catch { [DateTime]::MinValue } } else { [DateTime]::MinValue }
-                $dateStr = if ($item.ModTime -and $rawDate -ne [DateTime]::MinValue) { $rawDate.ToString("yyyy-MM-dd HH:mm") } else { "---" }
                 if ($item.IsDir) { 
                     $leaf = "$($item.Name)/"
-                    if (-not $seen[$leaf]) { $seen[$leaf] = $true; $parsed += [PSCustomObject]@{ Type = 0; Name = $leaf; RawDate = $rawDate; DisplayString = ("[DIR]  {0,-30} | {1}" -f $leaf, $dateStr) } }
+                    if (-not $seen[$leaf]) {
+                        $seen[$leaf] = $true
+                        [void]$parsed.Add((New-BrowserListItem -Type 0 -Name $leaf -RawDate $rawDate))
+                    }
                 } else { 
                     $leaf = $item.Name
-                    if (-not $seen[$leaf]) { $seen[$leaf] = $true; $parsed += [PSCustomObject]@{ Type = 1; Name = $leaf; RawDate = $rawDate; DisplayString = ("[FILE] {0,-30} | {1}" -f $leaf, $dateStr) } }
+                    if (-not $seen[$leaf]) {
+                        $seen[$leaf] = $true
+                        [void]$parsed.Add((New-BrowserListItem -Type 1 -Name $leaf -RawDate $rawDate))
+                    }
                 }
             } 
         }
@@ -1151,95 +1188,118 @@ function Get-CloudItems([string]$Prov, [string]$Buc, [string]$Pth, [bool]$DirOnl
 }
 
 function Update-Directory([bool]$IsSrc) {
-    $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    
-    $Prov = if ($IsSrc) { $Global:SrcProvider } else { $Global:DstProvider }
-    $Pth  = if ($IsSrc) { $Global:SrcPath } else { $Global:DstPath }
-    $LocP = if ($IsSrc) { $Global:SrcLocalPath } else { $Global:DstLocalPath }
-    $Buc  = if ($IsSrc) { $CmbSrcBucList.Text } else { $CmbDstBucList.Text }
-    
-    $Lbx  = if ($IsSrc) { $LbxSrcDir } else { $LbxDstDir }
-    $LblP = if ($IsSrc) { $LblSrcPath } else { $LblDstPath }
-
-    $Lbx.Items.Clear()
-    if (![string]::IsNullOrEmpty($Pth) -or ($Prov -eq "LOCAL" -and ![string]::IsNullOrEmpty($LocP) -and $LocP.Contains("\"))) {
-        [void]$Lbx.Items.Add((New-BrowserListItem -Type -1 -Name ".."))
+    if ($IsSrc) {
+        if ($Global:IsLoadingSrcDir) { return }
+        $Global:IsLoadingSrcDir = $true
+    } else {
+        if ($Global:IsLoadingDstDir) { return }
+        $Global:IsLoadingDstDir = $true
     }
 
-    $rawParsedItems = @()
-    if ($Prov -eq "GCS" -or $Prov -eq "GDRIVE") {
-        if ($Prov -eq "GCS" -and ([string]::IsNullOrWhiteSpace($Buc) -or $Buc -match "Select Bucket" -or $Buc -match "--- Bucket ---" -or $Buc -match "Type Bucket" -or $Buc -match "Loading buckets")) { $Form.Cursor = [System.Windows.Forms.Cursors]::Default; return }
-        $LblP.Text = if ($Prov -eq "GCS") { "Path: gs://$Buc/$Pth" } else { "Path: /$Pth" }
-        # Ensures $IsSrc is correctly passed downward to identify the billing project
-        $rawParsedItems = Get-CloudItems $Prov $Buc $Pth $false $IsSrc
-    } elseif ($Prov -eq "LOCAL") {
-        $LblP.Text = "Path: $LocP"
-        if (![string]::IsNullOrWhiteSpace($LocP) -and (Test-Path -LiteralPath $LocP)) {
-            $items = Get-ChildItem -LiteralPath $LocP -Force -ErrorAction SilentlyContinue
-            if ($null -ne $items) {
-                foreach ($item in $items) {
-                    $rawDate = $item.LastWriteTime; $dateStr = $rawDate.ToString("yyyy-MM-dd HH:mm")
-                    if ($item.PSIsContainer) {
-                        $leaf = "$($item.Name)/"
-                        $rawParsedItems += [PSCustomObject]@{ Type = 0; Name = $leaf; RawDate = $rawDate; DisplayString = ("[DIR]  {0,-30} | {1}" -f $leaf, $dateStr) }
-                    } else {
-                        $rawParsedItems += [PSCustomObject]@{ Type = 1; Name = $item.Name; RawDate = $rawDate; DisplayString = ("[FILE] {0,-30} | {1}" -f $item.Name, $dateStr) }
+    try {
+        $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        
+        $Prov = if ($IsSrc) { $Global:SrcProvider } else { $Global:DstProvider }
+        $Pth  = if ($IsSrc) { $Global:SrcPath } else { $Global:DstPath }
+        $LocP = if ($IsSrc) { $Global:SrcLocalPath } else { $Global:DstLocalPath }
+        $Buc  = if ($IsSrc) { $CmbSrcBucList.Text } else { $CmbDstBucList.Text }
+        
+        $Lbx  = if ($IsSrc) { $LbxSrcDir } else { $LbxDstDir }
+        $LblP = if ($IsSrc) { $LblSrcPath } else { $LblDstPath }
+        $projSel = if ($IsSrc) { $CmbSrcProjList.SelectedItem } else { $CmbDstProjList.SelectedItem }
+
+        $Lbx.Items.Clear()
+        if (![string]::IsNullOrEmpty($Pth) -or ($Prov -eq "LOCAL" -and ![string]::IsNullOrEmpty($LocP) -and $LocP.Contains("\"))) {
+            [void]$Lbx.Items.Add((New-BrowserListItem -Type -1 -Name ".."))
+        }
+
+        $rawParsedItems = New-Object System.Collections.ArrayList
+        if ($Prov -eq "GCS" -or $Prov -eq "GDRIVE") {
+            if ($Prov -eq "GCS" -and ([string]::IsNullOrWhiteSpace($Buc) -or $Buc -match "Select Bucket" -or $Buc -match "--- Bucket ---" -or $Buc -match "Type Bucket" -or $Buc -match "Loading buckets")) {
+                return
+            }
+            if ($Prov -eq "GDRIVE" -and $projSel -eq "Shared Drive" -and ([string]::IsNullOrWhiteSpace($Buc) -or $Buc -match "^---")) {
+                $Lbx.Items.Clear()
+                if ($IsSrc) { $ChkExclusions.Items.Clear() }
+                $LblP.Text = "Path: / (Select a Shared Drive)"
+                return
+            }
+
+            $LblP.Text = if ($Prov -eq "GCS") { "Path: gs://$Buc/$Pth (Loading...)" } else { "Path: /$Pth (Loading...)" }
+            [System.Windows.Forms.Application]::DoEvents()
+            # Ensures $IsSrc is correctly passed downward to identify the billing project
+            $cloudItems = Get-CloudItems $Prov $Buc $Pth $false $IsSrc
+            $LblP.Text = if ($Prov -eq "GCS") { "Path: gs://$Buc/$Pth" } else { "Path: /$Pth" }
+            if ($cloudItems) {
+                foreach ($ci in $cloudItems) {
+                    [void]$rawParsedItems.Add($ci)
+                }
+            }
+        } elseif ($Prov -eq "LOCAL") {
+            $LblP.Text = "Path: $LocP"
+            if (![string]::IsNullOrWhiteSpace($LocP) -and (Test-Path -LiteralPath $LocP)) {
+                $items = Get-ChildItem -LiteralPath $LocP -Force -ErrorAction SilentlyContinue
+                if ($null -ne $items) {
+                    foreach ($item in $items) {
+                        $rawDate = $item.LastWriteTime
+                        if ($item.PSIsContainer) {
+                            $leaf = "$($item.Name)/"
+                            [void]$rawParsedItems.Add((New-BrowserListItem -Type 0 -Name $leaf -RawDate $rawDate))
+                        } else {
+                            [void]$rawParsedItems.Add((New-BrowserListItem -Type 1 -Name $item.Name -RawDate $rawDate))
+                        }
                     }
                 }
             }
         }
-    }
 
-    $parsedItems = @()
-    foreach ($pItem in $rawParsedItems) {
-        $rawName = $pItem.Name -replace '/$', ''
-        if (-not ($IsSrc -and (Is-Filtered $rawName))) {
-            $parsedItems += $pItem
-        }
-    }
-
-    if ($parsedItems.Count -gt 0) {
-        $srt = if ($IsSrc) { $CmbSrcSort.SelectedItem } else { $CmbSort.SelectedItem }
-        switch ($srt) {
-            "Name (A-Z)" { $parsedItems = $parsedItems | Sort-Object Type, Name }
-            "Name (Z-A)" { $parsedItems = $parsedItems | Sort-Object Type, @{Expression='Name'; Descending=$true} }
-            "Date (New)" { $parsedItems = $parsedItems | Sort-Object Type, @{Expression='RawDate'; Descending=$true} }
-            "Date (Old)" { $parsedItems = $parsedItems | Sort-Object Type, RawDate }
-            default { $parsedItems = $parsedItems | Sort-Object Type, Name }
-        }
-        foreach ($pItem in $parsedItems) { [void]$Lbx.Items.Add($pItem) }
-    }
-    
-    if ($IsSrc) {
-        $ChkExclusions.Items.Clear()
-        if ($Prov -eq "LOCAL") {
-            try {
-                if (Test-Path -LiteralPath $LocP -ErrorAction Stop) { 
-                    $subs = Get-ChildItem $LocP -Force -ErrorAction SilentlyContinue 
-                    foreach($d in $subs){ 
-                        if (-not (Is-Filtered $d.Name)) {
-                            $prefix = if ($d.PSIsContainer) { "[DIR]  " } else { "[FILE] " }
-                            [void]$ChkExclusions.Items.Add("$prefix$($d.Name)", $true) 
-                        }
-                    } 
-                }
-            } catch {}
-        } else {
-            $subCloud = Get-CloudItems $Prov $Buc $Pth $false $IsSrc
-            foreach($d in $subCloud){ 
-                $rawName = $d.Name -replace '/$', ''
-                if (-not (Is-Filtered $rawName)) {
-                    $prefix = if ($d.Type -eq 0) { "[DIR]  " } else { "[FILE] " }
-                    [void]$ChkExclusions.Items.Add("$prefix$rawName", $true) 
-                }
+        $parsedItems = New-Object System.Collections.ArrayList
+        foreach ($pItem in $rawParsedItems) {
+            $rawName = $pItem.Name -replace '/$', ''
+            if (-not ($IsSrc -and (Is-Filtered $rawName))) {
+                [void]$parsedItems.Add($pItem)
             }
         }
+
+        $Lbx.BeginUpdate()
+        try {
+            if ($parsedItems.Count -gt 0) {
+                $srt = if ($IsSrc) { $CmbSrcSort.SelectedItem } else { $CmbSort.SelectedItem }
+                switch ($srt) {
+                    "Name (A-Z)" { $sorted = $parsedItems | Sort-Object Type, Name }
+                    "Name (Z-A)" { $sorted = $parsedItems | Sort-Object Type, @{Expression='Name'; Descending=$true} }
+                    "Date (New)" { $sorted = $parsedItems | Sort-Object Type, @{Expression='RawDate'; Descending=$true} }
+                    "Date (Old)" { $sorted = $parsedItems | Sort-Object Type, RawDate }
+                    default { $sorted = $parsedItems | Sort-Object Type, Name }
+                }
+                $parsedItems = $sorted
+                foreach ($pItem in $parsedItems) { [void]$Lbx.Items.Add($pItem) }
+            }
+        } finally {
+            $Lbx.EndUpdate()
+        }
+        
+        if ($IsSrc) {
+            $ChkExclusions.BeginUpdate()
+            try {
+                $ChkExclusions.Items.Clear()
+                foreach ($d in $parsedItems) {
+                    $rawName = $d.Name -replace '/$', ''
+                    $prefix = if ($d.Type -eq 0) { "[DIR]  " } else { "[FILE] " }
+                    [void]$ChkExclusions.Items.Add("$prefix$rawName", $true)
+                }
+            } finally {
+                $ChkExclusions.EndUpdate()
+            }
+        }
+        
+        if ($Global:SrcProvider -ne "" -and $Global:DstProvider -ne "") { 
+            if (-not $Global:LoadingHistory) { $BtnUpload.Enabled = $true } 
+        }
+    } finally {
+        if ($IsSrc) { $Global:IsLoadingSrcDir = $false } else { $Global:IsLoadingDstDir = $false }
+        $Form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
-    
-    if ($Global:SrcProvider -ne "" -and $Global:DstProvider -ne "") { 
-        if (-not $Global:LoadingHistory) { $BtnUpload.Enabled = $true } 
-    }
-    $Form.Cursor = [System.Windows.Forms.Cursors]::Default
 }
 
 function Sync-TasksToUI {
@@ -1519,28 +1579,89 @@ function Invoke-GlobalSignOut {
         $confirm = [System.Windows.Forms.MessageBox]::Show("Sign out of Google Drive? This will wipe your rclone auth token.", "Sign Out Google Drive", "YesNo", "Warning")
         if ($confirm -eq "Yes") {
             $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-            try { 
-                $pInfo = New-Object System.Diagnostics.ProcessStartInfo
-                $pInfo.FileName = $Global:RcloneExe
-                $pInfo.Arguments = "config delete `"$Global:RemoteName`" --config `"$Global:TempConfig`""
-                $pInfo.UseShellExecute = $false
-                $pInfo.CreateNoWindow = $true
-                $p = [System.Diagnostics.Process]::Start($pInfo)
-                $p.WaitForExit()
-            } catch {}
+            Stop-StaleRcloneAuth
+            if ($Global:RcloneExe -and (Test-Path -LiteralPath $Global:RcloneExe)) {
+                try { 
+                    $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+                    $pInfo.FileName = $Global:RcloneExe
+                    $pInfo.Arguments = "config delete `"$Global:RemoteName`" --config `"$Global:TempConfig`""
+                    $pInfo.UseShellExecute = $false
+                    $pInfo.CreateNoWindow = $true
+                    $p = [System.Diagnostics.Process]::Start($pInfo)
+                    $p.WaitForExit(5000)
+                } catch {}
+            }
             
-            # Extra hard wipe for rclone config
-            try {
-                if (Test-Path -LiteralPath $Global:TempConfig) {
-                    $rcloneConfigText = Get-Content -LiteralPath $Global:TempConfig -Raw
-                    $newConfigText = $rcloneConfigText -replace '(?ms)\[GWorkspaceAuth\].*?(?=\[|$)', ''
-                    $newConfigText | Out-File -LiteralPath $Global:TempConfig -Encoding utf8 -Force
-                }
-            } catch {}
+            Remove-RcloneRemoteSection $Global:RemoteName
+            $Global:DriveMap.Clear()
             
             $Form.Cursor = [System.Windows.Forms.Cursors]::Default
             [System.Windows.Forms.MessageBox]::Show("Google Drive credentials successfully cleared! You can now click Login/Auth to sign in with a different account.", "Signed Out") | Out-Null
         }
+    }
+}
+
+function Stop-StaleRcloneAuth {
+    if ($Global:AuthProcess) {
+        try {
+            if (-not $Global:AuthProcess.HasExited) {
+                Stop-Process -Id $Global:AuthProcess.Id -Force -ErrorAction SilentlyContinue
+            }
+        } catch {}
+        $Global:AuthProcess = $null
+    }
+
+    $isPort53682Active = $false
+    try {
+        $listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        if ($listeners | Where-Object { $_.Port -eq 53682 }) {
+            $isPort53682Active = $true
+        }
+    } catch {}
+
+    if (-not $Global:IsTransferring) {
+        Get-Process -Name "rclone" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    } elseif ($isPort53682Active) {
+        try {
+            $lines = & netstat.exe -ano -p tcp 2>$null
+            foreach ($line in $lines) {
+                if ($line -match ':53682\s+.*LISTENING\s+(\d+)') {
+                    $portPid = [int]$matches[1]
+                    if ($portPid -gt 0) {
+                        Stop-Process -Id $portPid -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        } catch {}
+    }
+}
+
+function Remove-RcloneRemoteSection([string]$SectionName) {
+    if (-not [string]::IsNullOrWhiteSpace($SectionName) -and (Test-Path -LiteralPath $Global:TempConfig)) {
+        try {
+            $cfg = Get-Content -LiteralPath $Global:TempConfig -Raw -ErrorAction SilentlyContinue
+            if ($cfg) {
+                $pattern = "(?ms)\[$([regex]::Escape($SectionName))\].*?(?=\[[^\]]+\]|\z)"
+                $newCfg = $cfg -replace $pattern, ''
+                $newCfg = ($newCfg -replace '(\r?\n){3,}', "`r`n`r`n").Trim()
+                if ($newCfg.Length -gt 0) { $newCfg += "`r`n" }
+                [System.IO.File]::WriteAllText($Global:TempConfig, $newCfg, (New-Object System.Text.UTF8Encoding($false)))
+            }
+        } catch {}
+    }
+}
+
+function Test-RcloneRemoteHasToken([string]$SectionName) {
+    if ([string]::IsNullOrWhiteSpace($SectionName) -or -not (Test-Path -LiteralPath $Global:TempConfig)) {
+        return $false
+    }
+    try {
+        $cfg = Get-Content -LiteralPath $Global:TempConfig -Raw -ErrorAction SilentlyContinue
+        if (-not $cfg) { return $false }
+        $pattern = "(?ms)\[$([regex]::Escape($SectionName))\](?:(?!\[[^\]]+\]).)*?token\s*=\s*\{[^\r\n]+\}"
+        return [bool]($cfg -match $pattern)
+    } catch {
+        return $false
     }
 }
 
@@ -1599,6 +1720,15 @@ function Handle-AuthClick([bool]$IsSrc) {
         }
 
         if ($Global:AppSettings.ForceRcloneGcs -and $Global:AppSettings.GcsAuthType -eq "UserOAuth") {
+            if ([string]::IsNullOrWhiteSpace($Global:RcloneExe) -or -not (Test-Path -LiteralPath $Global:RcloneExe)) {
+                Set-RcloneEnvironment
+            }
+            if ([string]::IsNullOrWhiteSpace($Global:RcloneExe) -or -not (Test-Path -LiteralPath $Global:RcloneExe)) {
+                $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+                Log-Message "Rclone executable not found. Please configure Rclone.exe Path in Settings." "LightCoral"
+                [System.Windows.Forms.MessageBox]::Show("Rclone.exe was not found. Please set the Rclone.exe path in Settings before authenticating.", "Rclone Not Found", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+                return
+            }
             try {
                 $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
                 try {
@@ -1606,7 +1736,8 @@ function Handle-AuthClick([bool]$IsSrc) {
                     $pDel.FileName = $Global:RcloneExe
                     $pDel.Arguments = "config delete `"$Global:GcsBridgeName`" --config `"$Global:TempConfig`""
                     $pDel.UseShellExecute = $false; $pDel.CreateNoWindow = $true
-                    [System.Diagnostics.Process]::Start($pDel).WaitForExit()
+                    $procDel = [System.Diagnostics.Process]::Start($pDel)
+                    $procDel.WaitForExit(5000)
                 } catch {}
 
                 $authArgs = "config create `"$Global:GcsBridgeName`" `"google cloud storage`" env_auth=false bucket_policy_only=true --config `"$Global:TempConfig`""
@@ -1653,6 +1784,16 @@ function Handle-AuthClick([bool]$IsSrc) {
             }
         }
     } else {
+        if ([string]::IsNullOrWhiteSpace($Global:RcloneExe) -or -not (Test-Path -LiteralPath $Global:RcloneExe)) {
+            Set-RcloneEnvironment
+        }
+        if ([string]::IsNullOrWhiteSpace($Global:RcloneExe) -or -not (Test-Path -LiteralPath $Global:RcloneExe)) {
+            $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+            Log-Message "Rclone executable not found. Please configure Rclone.exe Path in Settings." "LightCoral"
+            [System.Windows.Forms.MessageBox]::Show("Rclone.exe was not found. Please set the Rclone.exe path in Settings before authenticating.", "Rclone Not Found", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+            return
+        }
+
         $driveExtraArgs = ""
         if (-not [string]::IsNullOrWhiteSpace($Global:AppSettings.DriveClientId) -and -not [string]::IsNullOrWhiteSpace($Global:AppSettings.DriveClientSecret)) {
             $driveExtraArgs = " client_id=`"$($Global:AppSettings.DriveClientId)`" client_secret=`"$($Global:AppSettings.DriveClientSecret)`""
@@ -1660,8 +1801,10 @@ function Handle-AuthClick([bool]$IsSrc) {
         try {
             $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
 
-            # Always wipe the existing remote first so config create always runs with
-            # the currently saved credentials (built-in or custom Client ID).
+            # 1. Stop any stale rclone auth process and free port 53682
+            Stop-StaleRcloneAuth
+
+            # 2. Delete existing remote and strip section from config
             try {
                 $pDel = New-Object System.Diagnostics.ProcessStartInfo
                 $pDel.FileName = $Global:RcloneExe
@@ -1669,17 +1812,15 @@ function Handle-AuthClick([bool]$IsSrc) {
                 $pDel.UseShellExecute = $false
                 $pDel.CreateNoWindow = $true
                 $proc = [System.Diagnostics.Process]::Start($pDel)
-                $proc.WaitForExit()
+                $proc.WaitForExit(5000)
             } catch {}
-            # Also strip any leftover section from the config file directly
-            try {
-                if (Test-Path -LiteralPath $Global:TempConfig) {
-                    $cfg = Get-Content -LiteralPath $Global:TempConfig -Raw
-                    $cfg = $cfg -replace '(?ms)\[$([regex]::Escape($Global:RemoteName))\].*?(?=\[|\z)', ''
-                    $cfg | Out-File -LiteralPath $Global:TempConfig -Encoding utf8 -Force
-                }
-            } catch {}
+            Remove-RcloneRemoteSection $Global:RemoteName
+            $Global:DriveMap.Clear()
 
+            # 3. Log OAuth start
+            Log-Message "Starting Google Drive OAuth login in browser (http://127.0.0.1:53682/)..."
+
+            # 4. Start rclone config create and pump events with 180s timeout
             $authArgs = "config create `"$Global:RemoteName`" drive scope=drive team_drive=`"`"$driveExtraArgs --config `"$Global:TempConfig`""
             $pInfo = New-Object System.Diagnostics.ProcessStartInfo
             $pInfo.FileName = $Global:RcloneExe
@@ -1687,10 +1828,33 @@ function Handle-AuthClick([bool]$IsSrc) {
             $pInfo.UseShellExecute = $false
             $pInfo.CreateNoWindow = $false
             $p = [System.Diagnostics.Process]::Start($pInfo)
-            $p.WaitForExit()
+            $Global:AuthProcess = $p
 
-            if ($p.ExitCode -eq 0) { $ProvCmb.SelectedIndex = 0; $ProvCmb.SelectedIndex = 2 }
-        } catch {} finally {
+            $authSw = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not $p.HasExited -and $authSw.Elapsed.TotalSeconds -lt 180) {
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 150
+            }
+
+            if (-not $p.HasExited) {
+                Stop-StaleRcloneAuth
+                Remove-RcloneRemoteSection $Global:RemoteName
+            $Global:DriveMap.Clear()
+                Log-Message "Google Drive authentication timed out after 180 seconds." "LightCoral"
+                [System.Windows.Forms.MessageBox]::Show("Google Drive authentication timed out after 180 seconds. Please try again.", "Authentication Timeout", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+            } elseif ($p.ExitCode -eq 0 -and (Test-RcloneRemoteHasToken $Global:RemoteName)) {
+                Log-Message "Google Drive authentication succeeded." "LightGreen"
+                $ProvCmb.SelectedIndex = 0; $ProvCmb.SelectedIndex = 2
+            } else {
+                Remove-RcloneRemoteSection $Global:RemoteName
+            $Global:DriveMap.Clear()
+                Log-Message "Google Drive authentication failed or was cancelled (ExitCode: $($p.ExitCode))." "LightCoral"
+                [System.Windows.Forms.MessageBox]::Show("Google Drive authentication failed or was cancelled (ExitCode: $($p.ExitCode)).", "Authentication Failed", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+            }
+        } catch {
+            Log-Message "Google Drive authentication error: $($_.Exception.Message)" "LightCoral"
+        } finally {
+            $Global:AuthProcess = $null
             $Form.Cursor = [System.Windows.Forms.Cursors]::Default
         }
     }
@@ -1747,7 +1911,10 @@ function Handle-ProviderChange([bool]$IsSrc) {
     if ($Prov -eq "GCS") { 
         $CmbProj.Items.Clear(); [void]$CmbProj.Items.Add("Project"); $CmbProj.SelectedIndex=0; $CmbProj.Enabled=$false 
     } elseif ($Prov -eq "GDRIVE") { 
-        $CmbProj.Items.Clear(); [void]$CmbProj.Items.AddRange(@("My Drive", "Shared Drive")); $CmbProj.SelectedIndex=0; $CmbProj.Enabled=$true 
+        $CmbProj.Items.Clear(); [void]$CmbProj.Items.AddRange(@("My Drive", "Shared Drive"))
+        $Global:SuppressProjChange = $true
+        try { $CmbProj.SelectedIndex = 0 } finally { $Global:SuppressProjChange = $false }
+        $CmbProj.Enabled=$true 
     }
 
     if ($Prov -eq "") { 
@@ -1842,18 +2009,24 @@ function Handle-ProviderChange([bool]$IsSrc) {
             }
         }
         } elseif ($Prov -eq "GDRIVE") {
-            try { $d = Execute-Cli-Json -cmdArgs "about `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --json" -isRclone $true } catch { $d = $null }
-            if ($d) { 
-                $LblStat.Text = Get-DriveAuthLabel; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }; 
-                $BtnSignOut.Enabled = $true
-                $BtnAuth.Enabled = $false
-                $Lbx.Enabled = $true; 
-                if (-not $IsSrc -and -not $Global:LoadingHistory) { $BtnDstNewF.Enabled = $true; $BtnDstRef.Enabled = $true } 
-                Update-Directory $IsSrc 
-            } else { 
-                $LblStat.Text = "Not Connected"; $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightCoral" } else { "Red" }; 
+            if (-not (Test-RcloneRemoteHasToken $Global:RemoteName)) {
+                Remove-RcloneRemoteSection $Global:RemoteName
+                $Global:DriveMap.Clear()
+                $LblStat.Text = "Not Connected"
+                $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightCoral" } else { "Red" }
                 $BtnAuth.Enabled = $true
                 $BtnSignOut.Enabled = $false
+            } else {
+                $LblStat.Text = Get-DriveAuthLabel
+                $LblStat.ForeColor = if ($Global:AppSettings.IsDarkMode) { "LightGreen" } else { "Green" }
+                $BtnSignOut.Enabled = $true
+                $BtnAuth.Enabled = $false
+                $Lbx.Enabled = $true
+                if (-not $IsSrc -and -not $Global:LoadingHistory) {
+                    $BtnDstNewF.Enabled = $true
+                    $BtnDstRef.Enabled = $true
+                }
+                Update-Directory $IsSrc
             }
         }
     }
@@ -1862,7 +2035,7 @@ $CmbSrcProvider.Add_SelectedIndexChanged({ Handle-ProviderChange $true })
 $CmbDstProvider.Add_SelectedIndexChanged({ Handle-ProviderChange $false })
 
 function Handle-ProjChange([bool]$IsSrc) {
-    if ($Global:LoadingHistory) { return }
+    if ($Global:LoadingHistory -or $Global:SuppressProjChange) { return }
     $Prov = if($IsSrc){$Global:SrcProvider}else{$Global:DstProvider}
     $CmbProj = if($IsSrc){$CmbSrcProjList}else{$CmbDstProjList}; $CmbBuc = if($IsSrc){$CmbSrcBucList}else{$CmbDstBucList}
     
@@ -1956,20 +2129,64 @@ function Handle-ProjChange([bool]$IsSrc) {
     } elseif ($Prov -eq "GDRIVE") {
         $CmbBuc.DropDownStyle = "DropDownList"
         if($IsSrc){$Global:SrcPath=""}else{$Global:DstPath=""}
+        $Lbx = if($IsSrc){$LbxSrcDir}else{$LbxDstDir}
+        $LblP = if($IsSrc){$LblSrcPath}else{$LblDstPath}
+
         if($CmbProj.SelectedItem -eq "Shared Drive"){
-            try { $d = Execute-Cli-Json -cmdArgs "backend drives `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --json" -isRclone $true } catch { $d = $null }
-            $CmbBuc.Items.Clear()
-            if ($d) { 
-                $dArray = if ($d -is [array]) { $d } else { @($d) }
-                foreach($i in $dArray){ [void]$CmbBuc.Items.Add($i.name); $Global:DriveMap[$i.name]=$i.id }
-                $CmbBuc.Enabled = $true; $CmbBuc.Visible = $true
-                if($CmbBuc.Items.Count -gt 0){ $CmbBuc.SelectedIndex = 0 } 
+            $Lbx.Items.Clear()
+            if ($IsSrc) { $ChkExclusions.Items.Clear() }
+            $Lbx.Enabled = $false
+
+            if ($Global:DriveMap.Count -eq 0) {
+                $LblP.Text = "Path: / (Loading Shared Drives...)"
+                $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+                try {
+                    $d = Execute-Cli-Json -cmdArgs "backend drives `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --contimeout 10s --timeout 15s --retries 1 --json" -isRclone $true
+                    if ($d) {
+                        $dArray = if ($d -is [array]) { $d } else { @($d) }
+                        foreach ($i in $dArray) {
+                            if ($i.name -and $i.id) { $Global:DriveMap[$i.name] = $i.id }
+                        }
+                    }
+                } catch {} finally {
+                    $Form.Cursor = [System.Windows.Forms.Cursors]::Default
+                }
+            }
+
+            $CmbBuc.BeginUpdate()
+            try {
+                $CmbBuc.Items.Clear()
+                if ($Global:DriveMap.Count -gt 0) {
+                    [void]$CmbBuc.Items.Add("--- Select Shared Drive ---")
+                    foreach ($dName in ($Global:DriveMap.Keys | Sort-Object)) {
+                        [void]$CmbBuc.Items.Add($dName)
+                    }
+                    $CmbBuc.Enabled = $true; $CmbBuc.Visible = $true
+                    if ($Global:DriveMap.Count -eq 1) {
+                        $CmbBuc.SelectedIndex = 1
+                    } else {
+                        $CmbBuc.SelectedIndex = 0
+                        $LblP.Text = "Path: / (Select a Shared Drive)"
+                    }
+                } else {
+                    [void]$CmbBuc.Items.Add("[ No Shared Drives Found ]")
+                    $CmbBuc.Enabled = $false; $CmbBuc.Visible = $true
+                    $CmbBuc.SelectedIndex = 0
+                    $LblP.Text = "Path: / (No Shared Drives Found)"
+                }
+            } finally {
+                $CmbBuc.EndUpdate()
             }
         } else { 
             $CmbBuc.Items.Clear()
             $CmbBuc.Text = ""
             $CmbBuc.Enabled = $false
             $CmbBuc.Visible = $false
+            $Lbx.Enabled = $true
+            if (-not $IsSrc -and -not $Global:LoadingHistory) {
+                $BtnDstNewF.Enabled = $true
+                $BtnDstRef.Enabled = $true
+            }
             Update-Directory $IsSrc 
         }
     }
@@ -2797,6 +3014,7 @@ $CleanLogString
 })
 
 $Form.Add_FormClosing({
+    Stop-StaleRcloneAuth
     if ($Global:CurrentProcess -and -not $Global:CurrentProcess.HasExited) {
         try { Start-Process "taskkill.exe" -ArgumentList "/PID $($Global:CurrentProcess.Id) /T /F" -WindowStyle Hidden -Wait } catch {}
     }

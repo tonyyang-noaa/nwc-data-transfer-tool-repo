@@ -8,8 +8,8 @@
 
 ## Guide Version & Compatibility
 * **Target PowerShell Script**: `data_transfer_tool.ps1`
-* **Application Version**: `v1.1.51`
-* **Last Updated**: September 2026
+* **Application Version**: `v1.1.52`
+* **Last Updated**: November 2026
 
 > **Note on Maintenance**: This document is synchronized directly with `data_transfer_tool.ps1`. Whenever new features, settings, or authentication options are introduced in script version updates, this User Guide is updated accordingly.
 
@@ -36,7 +36,7 @@ The **Data Transfer Tool** is a PowerShell Windows Forms application designed fo
 
 ```
 +---------------------------------------------------------------------------------------------------------+
-| Data Transfer Tool v1.1.51                                                                    [_][square][X] |
+| Data Transfer Tool v1.1.52                                                                    [_][square][X] |
 +---------------------------------------------------------------------------------------------------------+
 | [ Left Panel ]            | [ Source Storage Panel ]            | [ Target Storage Panel ]              |
 | - Dark Mode Toggle        | - Provider: LOCAL / GCS / GDRIVE    | - Provider: LOCAL / GCS / GDRIVE      |

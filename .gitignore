@@ -65,6 +65,9 @@ network_transfer.ico
 
 # Local Vercel deployment configuration
 .vercel
+.agents/
+AGENTS.md
+graphify-out/
 
 # Backup files
 *.backup

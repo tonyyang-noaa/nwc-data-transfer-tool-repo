@@ -411,7 +411,7 @@ powershell.exe -ExecutionPolicy Bypass -File .\data_transfer_tool.ps1
 #### Option B: Running the Packaged Executable
 If using the compiled binary distribution:
 ```cmd
-.\DataTransferTool_v1.1.51.exe
+.\DataTransferTool_v1.1.52.exe
 ```
 
 ---
@@ -482,6 +482,6 @@ If using the compiled binary distribution:
 ## 9. License & Maintenance
 
 * **Repository**: `nwc-data-transfer-tool-repo`
-* **Version**: `v1.1.51`
+* **Version**: `v1.1.52`
 * **Disclaimer**: NOAA Scientific Product Disclaimer applies. Refer to top notice.
 
