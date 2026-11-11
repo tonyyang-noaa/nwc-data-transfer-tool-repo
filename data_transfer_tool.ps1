@@ -584,7 +584,7 @@ function New-BrowserListItem([int]$Type, [string]$Name, [DateTime]$RawDate = [Da
 
 function Invoke-CliProcessNonBlocking([string]$ExePath, [string]$CmdArgs, [int]$TimeoutSeconds = 45) {
     if ([string]::IsNullOrWhiteSpace($ExePath)) {
-        return [PSCustomObject]@{ ExitCode = -1; Output = ""; Command = "" }
+        return [PSCustomObject]@{ ExitCode = -1; Output = ""; StdOut = ""; StdErr = ""; Command = "" }
     }
 
     $pInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -605,7 +605,7 @@ function Invoke-CliProcessNonBlocking([string]$ExePath, [string]$CmdArgs, [int]$
     try {
         $proc = [System.Diagnostics.Process]::Start($pInfo)
     } catch {
-        return [PSCustomObject]@{ ExitCode = -1; Output = $_.Exception.Message; Command = "$ExePath $CmdArgs" }
+        return [PSCustomObject]@{ ExitCode = -1; Output = $_.Exception.Message; StdOut = ""; StdErr = $_.Exception.Message; Command = "$ExePath $CmdArgs" }
     }
 
     $stdOutTask = $proc.StandardOutput.ReadToEndAsync()
@@ -632,6 +632,8 @@ function Invoke-CliProcessNonBlocking([string]$ExePath, [string]$CmdArgs, [int]$
     return [PSCustomObject]@{
         ExitCode = $exitCode
         Output = if ($combined) { $combined } else { "" }
+        StdOut = if ($stdOut) { $stdOut } else { "" }
+        StdErr = if ($stdErr) { $stdErr } else { "" }
         Command = "$ExePath $CmdArgs"
     }
 }
@@ -641,10 +643,8 @@ function Execute-Cli-Json($cmdArgs, [bool]$isRclone = $false) {
     $exePath = if ($isRclone) { $Global:RcloneExe } else { if ($Global:GCloudBin) { Join-Path $Global:GCloudBin "gcloud.cmd" } else { "gcloud.cmd" } }
     
     $res = Invoke-CliProcessNonBlocking -ExePath $exePath -CmdArgs $cmdArgs -TimeoutSeconds 45
-    $outData = $res.Output
-    
-    if (![string]::IsNullOrWhiteSpace($outData)) {
-        $outData = $outData.Trim()
+    if ($res.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($res.StdOut)) {
+        $outData = $res.StdOut.Trim()
         $firstChar = $outData.IndexOfAny([char[]]('[', '{'))
         $lastChar = $outData.LastIndexOfAny([char[]](']', '}'))
         
@@ -962,6 +962,7 @@ function Get-CloudItems([string]$Prov, [string]$Buc, [string]$Pth, [bool]$DirOnl
             if ($result) {
                 $rArray = if ($result -is [array]) { $result } else { @($result) }
                 foreach ($i in $rArray) {
+                    if ($null -eq $i -or [string]::IsNullOrWhiteSpace($i.Name)) { continue }
                     $rawDate = if ($i.ModTime) { try { [DateTime]::Parse($i.ModTime) } catch { [DateTime]::MinValue } } else { [DateTime]::MinValue }
                     if ($i.IsDir) {
                         $leaf = "$($i.Name)/"
@@ -1143,7 +1144,7 @@ function Get-CloudItems([string]$Prov, [string]$Buc, [string]$Pth, [bool]$DirOnl
                 return $parsed
             }
             if (-not $Global:DriveMap.ContainsKey($Buc)) {
-                $d = Execute-Cli-Json -cmdArgs "backend drives `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --contimeout 10s --timeout 15s --retries 1 --json" -isRclone $true
+                $d = Execute-Cli-Json -cmdArgs "backend drives `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --contimeout 15s --timeout 30s --json" -isRclone $true
                 if ($d) {
                     $dArray = if ($d -is [array]) { $d } else { @($d) }
                     foreach ($i in $dArray) {
@@ -1160,13 +1161,14 @@ function Get-CloudItems([string]$Prov, [string]$Buc, [string]$Pth, [bool]$DirOnl
             $target = "${Global:RemoteName}:${Pth}"
         }
 
-        $args = "lsjson `"$target`" --config `"$Global:TempConfig`" --max-depth 1 --no-mimetype --drive-use-trash=false --drive-skip-shortcuts --drive-list-chunk=1000 --contimeout 10s --timeout 30s --retries 1 --low-level-retries 1"
+        $args = "lsjson `"$target`" --config `"$Global:TempConfig`" --max-depth 1 --no-mimetype --drive-use-trash=false --drive-skip-shortcuts --drive-list-chunk=1000 --contimeout 15s --timeout 30s"
         if ($DirOnly) { $args += " --dirs-only" }
 
         $result = Execute-Cli-Json -cmdArgs $args -isRclone $true
         if ($result) { 
             $rArray = if ($result -is [array]) { $result } else { @($result) }
             foreach ($item in $rArray) { 
+                if ($null -eq $item -or [string]::IsNullOrWhiteSpace($item.Name)) { continue }
                 $rawDate = if ($item.ModTime) { try { [DateTime]::Parse($item.ModTime) } catch { [DateTime]::MinValue } } else { [DateTime]::MinValue }
                 if ($item.IsDir) { 
                     $leaf = "$($item.Name)/"
@@ -2141,7 +2143,7 @@ function Handle-ProjChange([bool]$IsSrc) {
                 $LblP.Text = "Path: / (Loading Shared Drives...)"
                 $Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
                 try {
-                    $d = Execute-Cli-Json -cmdArgs "backend drives `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --contimeout 10s --timeout 15s --retries 1 --json" -isRclone $true
+                    $d = Execute-Cli-Json -cmdArgs "backend drives `"${Global:RemoteName}:`" --config `"$Global:TempConfig`" --contimeout 15s --timeout 30s --json" -isRclone $true
                     if ($d) {
                         $dArray = if ($d -is [array]) { $d } else { @($d) }
                         foreach ($i in $dArray) {
