@@ -19,6 +19,7 @@
 1. [Overview & Interface Layout](#1-overview--interface-layout)
 2. [Step-by-Step Transfer Workflows](#2-step-by-step-transfer-workflows)
    - [Workflow A: Transferring Local Files/Folders to Google Drive](#workflow-a-transferring-local-filesfolders-to-google-drive)
+     - [Google Drive - Custom OAuth Credentials (Client ID / Secret)](#google-drive---custom-oauth-credentials-client-id--secret)
    - [Workflow B: Transferring Local Files/Folders to Google Cloud Storage (GCS)](#workflow-b-transferring-local-filesfolders-to-google-cloud-storage-gcs)
    - [Workflow C: Transferring Files/Folders from Google Drive to Google Cloud Storage (GCS)](#workflow-c-transferring-filesfolders-from-google-drive-to-google-cloud-storage-gcs)
 3. [Configuration & Settings Options Reference](#3-configuration--settings-options-reference)
@@ -78,6 +79,21 @@ Use this workflow to upload local files or directories from your computer or net
    - Use **Check All** or **Uncheck All** for quick bulk selection.
 
 #### Step 2: Set Up Destination Storage (Google Drive)
+
+##### Google Drive - Custom OAuth Credentials (Client ID / Secret)
+
+By default, the tool authenticates to Google Drive through a built-in shared OAuth application. For most users this works seamlessly. However, if your organization requires transfers under a dedicated Google Cloud project, or if you encounter API quota limits caused by shared credential usage, you can supply your own OAuth Client ID and Secret. To obtain an OAuth Client ID, please submit a [Google Cloud Platform (GCP) Service Request](https://apps-st.fisheries.noaa.gov/jira/servicedesk/customer/portal/14/create/394) request.
+
+When credentials are supplied:
+
+- All Google Drive API calls (transfers, authentication, and token refreshes) are routed through your own OAuth application instead of the shared built-in one.
+- Your transfers have a dedicated API quota, separate from other users of this tool.
+- The **Login / Auth** button label updates to **`Auth (GDrive - Custom ID)`** to confirm your custom credentials are active, or **`Auth (GDrive - Built-in)`** when no credentials are set.
+- Credentials are optional. If the Client ID and Secret fields are left blank, the tool falls back to its standard built-in OAuth application with no change in functionality.
+- No manual **Sign Out** step is required when switching credentials. Update the fields, save, and click **Login / Auth**; the tool handles the reset automatically.
+
+Configure the Client ID and Secret in **Settings** before clicking **Login / Auth**. The settings fields are described in [Configuration Settings Modal](#31-configuration-settings-modal).
+
 1. In the **Target Storage** panel (top-right), select **`GDRIVE`** from the Storage Provider dropdown.
 2. Observe the authentication badge:
    - **`Auth (GDrive - Built-in)`**: Standard built-in Rclone OAuth credentials.
